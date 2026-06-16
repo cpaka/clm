@@ -135,8 +135,15 @@ def fetch_corpus(n_articles: int = CORPUS_CONFIG["n_articles"],
         if rvcontinue:
             params["rvcontinue"] = rvcontinue
 
-        resp = requests.get(api, params=params, timeout=30)
-        data = resp.json()
+        try:
+            resp = requests.get(api, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            print(f"Wikipedia API error (skipping batch): {e}")
+            time.sleep(2)
+            rvcontinue = None
+            continue
 
         for page in data.get("query", {}).get("pages", []):
             if page.get("missing"):

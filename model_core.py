@@ -107,7 +107,8 @@ class Segment:
 class Column:
     def __init__(self, col_dim, cells_per_col, loc_dim, seed=0,
                  connected=0.5, init_perm=0.21, inc=0.10, dec=0.02, pred_dec=0.01,
-                 activation_threshold=10, min_threshold=5, new_synapses=20):
+                 activation_threshold=10, min_threshold=5, new_synapses=20,
+                 max_segs_per_cell=5):
         self.cpc = cells_per_col
         self.total_cells = col_dim * cells_per_col
         self.loc_dim = loc_dim
@@ -121,6 +122,7 @@ class Column:
         self.activation_threshold = activation_threshold
         self.min_threshold = min_threshold
         self.new_synapses = new_synapses
+        self.max_segs_per_cell = max_segs_per_cell
         self.rng = random.Random(seed)
         # Inference cache: cell -> list of frozenset(connected source ids)
         self._conn_cache: dict[int, list[frozenset]] | None = None
@@ -160,23 +162,44 @@ class Column:
                 buf[idx] = True
         return buf
 
-    def _segment_overlaps(self, active: np.ndarray):
-        """Vectorised: boolean-index each segment's sources against active buffer."""
+    def _segment_overlaps(self, active: np.ndarray, hint_cols=None):
+        """Vectorised: boolean-index each segment's sources against active buffer.
+
+        hint_cols: if provided, only evaluate segments for cells in those columns.
+        This makes training O(active_cols × cells_per_col × max_segs) instead of
+        O(total_segments), eliminating the quadratic slowdown as segments accumulate.
+        """
         predictive: set[int] = set()
         pot: dict[tuple, int] = {}
         conn: dict[tuple, int] = {}
         thresh = self.activation_threshold
         connected = self.connected
 
-        for cell, segs in self.segments.items():
-            for si, seg in enumerate(segs):
-                m = active[seg.sources]
-                po = int(m.sum())
-                co = int((m & (seg.perms >= connected)).sum())
-                pot[(cell, si)] = po
-                conn[(cell, si)] = co
-                if co >= thresh:
-                    predictive.add(cell)
+        if hint_cols is not None:
+            for col in hint_cols:
+                for ci in range(self.cpc):
+                    cell = col * self.cpc + ci
+                    segs = self.segments.get(cell)
+                    if not segs:
+                        continue
+                    for si, seg in enumerate(segs):
+                        m = active[seg.sources]
+                        po = int(m.sum())
+                        co = int((m & (seg.perms >= connected)).sum())
+                        pot[(cell, si)] = po
+                        conn[(cell, si)] = co
+                        if co >= thresh:
+                            predictive.add(cell)
+        else:
+            for cell, segs in self.segments.items():
+                for si, seg in enumerate(segs):
+                    m = active[seg.sources]
+                    po = int(m.sum())
+                    co = int((m & (seg.perms >= connected)).sum())
+                    pot[(cell, si)] = po
+                    conn[(cell, si)] = co
+                    if co >= thresh:
+                        predictive.add(cell)
 
         return predictive, pot, conn
 
@@ -225,10 +248,10 @@ class Column:
             )
 
     def step(self, feature_sdr, loc_sdr, learn: bool = True):
-        active = self._set_active(self.prev_winners, loc_sdr)
-        predictive, pot, conn = self._segment_overlaps(active)
-
         active_cols = [int(c) for c in feature_sdr]
+        active = self._set_active(self.prev_winners, loc_sdr)
+        predictive, pot, conn = self._segment_overlaps(active, hint_cols=active_cols)
+
         active_col_set = set(active_cols)
         winners: set[int] = set()
 
@@ -256,7 +279,7 @@ class Column:
                     if ov_best >= self.min_threshold and si_best >= 0:
                         self._adapt(self.segments[cell_best][si_best], active,
                                     grow=self.new_synapses - ov_best)
-                    else:
+                    elif len(self.segments.get(cell_best, ())) < self.max_segs_per_cell:
                         self._grow_segment(cell_best, active)
 
         if learn:
@@ -294,12 +317,13 @@ class Column:
 class CGLMUnit:
     def __init__(self, col_dim=1024, w=16, cells_per_col=8,
                  periods=(7, 11, 13, 17, 19, 23), seed=0,
-                 activation_threshold=10, new_synapses=20):
+                 activation_threshold=10, new_synapses=20, max_segs_per_cell=5):
         self.enc = TokenEncoder(col_dim, w, seed)
         self.grid = GridLocation(periods)
         self.col = Column(col_dim, cells_per_col, self.grid.dim, seed=seed,
                           activation_threshold=activation_threshold,
-                          new_synapses=new_synapses)
+                          new_synapses=new_synapses,
+                          max_segs_per_cell=max_segs_per_cell)
         self.w = w
         self.token_sdr: dict[str, np.ndarray] = {}
         self.inv: dict[int, list[str]] = defaultdict(list)
@@ -479,12 +503,13 @@ class SemanticEncoder:
 class SemanticUnit(CGLMUnit):
     def __init__(self, encoder: SemanticEncoder, cells_per_col=8,
                  periods=(7, 11, 13, 17, 19, 23), seed=0,
-                 activation_threshold=10, new_synapses=20):
+                 activation_threshold=10, new_synapses=20, max_segs_per_cell=5):
         self.enc = encoder
         self.grid = GridLocation(periods)
         self.col = Column(encoder.dim, cells_per_col, self.grid.dim, seed=seed,
                           activation_threshold=activation_threshold,
-                          new_synapses=new_synapses)
+                          new_synapses=new_synapses,
+                          max_segs_per_cell=max_segs_per_cell)
         self.w = encoder.fp_bits
         self.token_sdr: dict[str, np.ndarray] = {}
         self.inv: dict[int, list[str]] = defaultdict(list)
@@ -493,7 +518,7 @@ class SemanticUnit(CGLMUnit):
 class SemanticCorticalGridLM(CorticalGridLM):
     def __init__(self, n_columns=3, dim=2048, fp_bits=21, index_bits=7,
                  window=2, cells_per_col=8, periods=(7, 11, 13, 17, 19, 23),
-                 activation_threshold=10, new_synapses=20):
+                 activation_threshold=10, new_synapses=20, max_segs_per_cell=5):
         self.encoders = [
             SemanticEncoder(dim, fp_bits, index_bits, window, seed=i)
             for i in range(n_columns)
@@ -503,6 +528,7 @@ class SemanticCorticalGridLM(CorticalGridLM):
             periods=periods,
             activation_threshold=activation_threshold,
             new_synapses=new_synapses,
+            max_segs_per_cell=max_segs_per_cell,
         )
         self.units: list[SemanticUnit] = []
 

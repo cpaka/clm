@@ -374,10 +374,7 @@ def bootstrap(force: bool = False):
         return
 
     print(f"[{VERSION}] Step 1/2: fetching corpus...")
-    corpus_info = fetch_corpus.local(
-        n_articles=CORPUS_CONFIG["n_articles"],
-        max_chars=CORPUS_CONFIG["max_chars"],
-    )
+    corpus_info = fetch_corpus.local(max_chars=CORPUS_CONFIG["max_chars"])
 
     print(f"[{VERSION}] Step 2/2: training...")
     result = train.local(test_fraction=TRAIN_CONFIG["test_fraction"])

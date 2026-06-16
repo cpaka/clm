@@ -153,6 +153,14 @@ def fetch_corpus(max_chars: int = CORPUS_CONFIG["max_chars"]) -> dict:
     url = f"https://www.kaggle.com/api/v1/datasets/download/{KAGGLE_DATASET}"
     print(f"Downloading {url} ...")
     resp = requests.get(url, headers=auth_header, stream=True, allow_redirects=True, timeout=120)
+    if resp.status_code == 403:
+        raise RuntimeError(
+            f"403 Forbidden downloading {KAGGLE_DATASET}. "
+            "The dataset likely requires license acceptance. "
+            f"Visit https://www.kaggle.com/datasets/{KAGGLE_DATASET} "
+            "and click Download to accept the license, then redeploy. "
+            f"Response: {resp.text[:300]}"
+        )
     resp.raise_for_status()
 
     zip_bytes = io.BytesIO(resp.content)

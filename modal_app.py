@@ -285,7 +285,8 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
     test_seq = sequences[:split]
     train_seq = sequences[split:]
 
-    print(f"Train={len(train_seq)} seqs, Test={len(test_seq)} seqs")
+    print(f"[train] Train={len(train_seq)} seqs, Test={len(test_seq)} seqs, "
+          f"Epochs={TRAIN_CONFIG['epochs']}")
 
     cfg = {**MODEL_CONFIG, "periods": tuple(MODEL_CONFIG["periods"])}
     model = SemanticCorticalGridLM(**cfg)
@@ -293,12 +294,24 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
     epoch_metrics: list[dict] = []
     for epoch in range(1, TRAIN_CONFIG["epochs"] + 1):
         t0 = time.time()
+        if epoch == 1:
+            print(f"[train] epoch {epoch}: fitting encoders + training {len(train_seq)} sequences...")
+        else:
+            print(f"[train] epoch {epoch}: training {len(train_seq)} sequences...")
         model.train_one_epoch(train_seq)
         elapsed = time.time() - t0
+        print(f"[train] epoch {epoch}: done in {elapsed:.1f}s")
 
+        print(f"[train] epoch {epoch}: evaluating accuracy...")
+        t_acc = time.time()
         t1, t3 = accuracy(model, test_seq, max_probes=200)
         tr1, tr3 = accuracy(model, train_seq[:100], max_probes=100)
         stats = model.stats()
+        print(f"[train] epoch {epoch}: accuracy done in {time.time()-t_acc:.1f}s — "
+              f"test_top1={t1:.1f}% test_top3={t3:.1f}% "
+              f"train_top1={tr1:.1f}% "
+              f"vocab={stats['vocab']} segs={stats['segments_per_unit']} "
+              f"syns={stats['synapses_per_unit']}")
 
         rec = {
             "epoch": epoch,
@@ -312,8 +325,9 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
             "synapses": stats["synapses_per_unit"],
         }
         epoch_metrics.append(rec)
-        print(f"  epoch {epoch}: test_top1={t1:.1f}% test_top3={t3:.1f}% ({elapsed:.0f}s)")
 
+    print(f"[train] finalizing model and saving to {VOL_PATH}...")
+    t_save = time.time()
     for u in model.units:
         u.finalize()
 
@@ -321,6 +335,7 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
     (VOL_PATH / "metrics.json").write_text(json.dumps(epoch_metrics, indent=2))
     _write_notebook(epoch_metrics)
     vol.commit()
+    print(f"[train] saved in {time.time()-t_save:.1f}s")
 
     final = epoch_metrics[-1]
     return {
@@ -434,9 +449,12 @@ def _write_notebook(epoch_metrics: list[dict]):
 # Bootstrap — called once after each deploy to fetch + train + record
 # ---------------------------------------------------------------------------
 
-@app.function(image=image, secrets=[kaggle_secret], volumes={_VOL_MOUNT: vol}, timeout=900)
+@app.function(image=image, secrets=[kaggle_secret], volumes={_VOL_MOUNT: vol}, timeout=200)
 def bootstrap(force: bool = False):
     """Idempotent post-deploy pipeline: dataset check → corpus sample → train → registry."""
+    import time as _time
+    t_boot = _time.time()
+
     VOL_PATH.mkdir(parents=True, exist_ok=True)
 
     model_path = VOL_PATH / "model.pkl"
@@ -447,16 +465,23 @@ def bootstrap(force: bool = False):
     # Step 0: ensure the shared raw dataset is present (download only if missing)
     if not DATASET_PATH.exists():
         print(f"[{VERSION}] Step 0/3: raw dataset not found — uploading from Kaggle...")
+        t0 = _time.time()
         upload_dataset.local()
+        print(f"[{VERSION}] Step 0/3: dataset upload done ({_time.time()-t0:.1f}s)")
     else:
         size_mb = DATASET_PATH.stat().st_size / 1_048_576
-        print(f"[{VERSION}] Step 0/3: raw dataset already present ({size_mb:.1f} MB) ✓")
+        print(f"[{VERSION}] Step 0/3: raw dataset present ({size_mb:.1f} MB) ✓  [{_time.time()-t_boot:.1f}s]")
 
-    print(f"[{VERSION}] Step 1/3: sampling corpus from dataset...")
+    print(f"[{VERSION}] Step 1/3: sampling corpus...  [{_time.time()-t_boot:.1f}s]")
+    t1 = _time.time()
     corpus_info = fetch_corpus.local(max_chars=CORPUS_CONFIG["max_chars"])
+    print(f"[{VERSION}] Step 1/3: corpus ready — {corpus_info['articles']} articles, "
+          f"{corpus_info['chars']:,} chars  ({_time.time()-t1:.1f}s)  [{_time.time()-t_boot:.1f}s]")
 
-    print(f"[{VERSION}] Step 2/3: training...")
+    print(f"[{VERSION}] Step 2/3: training...  [{_time.time()-t_boot:.1f}s]")
+    t2 = _time.time()
     result = train.local(test_fraction=TRAIN_CONFIG["test_fraction"])
+    print(f"[{VERSION}] Step 2/3: training done ({_time.time()-t2:.1f}s)  [{_time.time()-t_boot:.1f}s]")
 
     if "error" in result:
         print(f"[{VERSION}] Training failed: {result['error']}")
@@ -479,10 +504,12 @@ def bootstrap(force: bool = False):
     _upsert_registry(entry)
     vol.commit()
 
+    total = _time.time() - t_boot
     print(
-        f"[{VERSION}] Done — test_top1={entry['test_top1']}%  "
-        f"test_top3={entry['test_top3']}%  vocab={entry['vocab']}  "
-        f"time={entry['train_seconds']}s"
+        f"[{VERSION}] ✓ bootstrap done in {total:.1f}s — "
+        f"test_top1={entry['test_top1']}%  test_top3={entry['test_top3']}%  "
+        f"vocab={entry['vocab']}  train_seqs={entry['train_sequences']}  "
+        f"train_time={entry['train_seconds']}s"
     )
 
 

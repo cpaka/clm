@@ -29,6 +29,22 @@ import time
 from pathlib import Path
 
 import modal
+from pydantic import BaseModel
+
+
+# Request body models — defined at MODULE level so FastAPI can resolve their
+# (stringified, due to `from __future__ import annotations`) type hints via the
+# module globals.  Defining them inside serve() makes them unresolvable, which
+# silently demotes body params to query params.
+class PredictReq(BaseModel):
+    tokens: list[str] = []
+    topn: int = 5
+
+
+class GenerateReq(BaseModel):
+    tokens: list[str] = []
+    n: int = 10
+
 
 # ---------------------------------------------------------------------------
 # Version — bump to create a new independent deployment + isolated volume dir
@@ -43,14 +59,18 @@ VERSION = "v2"
 # of truth for SDR width (encoder dim is forced to match).
 # ---------------------------------------------------------------------------
 
+# --- SMALL "smoke-test" preset: ~2 min training on Modal's 4-CPU container. ---
+# Scale up (col_dim, n_units, max_sequences, epochs) once predictability is
+# confirmed.  The active-column-scoped overlap makes col_dim nearly free for
+# training cost, so widen col_dim first when scaling.
 CORPUS_CONFIG = {
     "name": "plain-text-wikipedia-simpleenglish (ffatty/plain-text-wikipedia-simpleenglish)",
-    "max_chars": 60_000,   # → 400_000 once inference confirmed
+    "max_chars": 40_000,   # → 400_000 when scaling up
 }
 
 TRAIN_CONFIG = {
-    "epochs": 3,           # → more once inference confirmed
-    "max_sequences": 600,  # → 3000 once inference confirmed
+    "epochs": 2,           # → more when scaling up
+    "max_sequences": 150,  # → 3000 when scaling up  (~2 min on 4-CPU)
     "test_fraction": 0.15,
     "replay_every": 2,     # hippocampal replay cadence (epochs)
 }
@@ -61,17 +81,17 @@ MODEL_CONFIG = {
     "n_levels": 2,
     "strides": (1, 4),         # token level + phrase level
     "n_units": 3,              # voting columns per level
-    "col_dim": 2048,           # SDR width / mini-column count
+    "col_dim": 1024,           # SDR width / mini-column count
     "cells_per_col": 8,        # temporal context depth
     "fp_bits": 21,             # active bits per fingerprint
     "index_bits": 7,           # identity-core bits
     "window": 2,               # semantic co-occurrence window
     "kwta_k": 42,              # lateral inhibition: winners kept
-    "replay_cap": 512,         # hippocampal buffer size
+    "replay_cap": 128,         # hippocampal buffer size
     "periods": (7, 11, 13, 17, 19, 23),
-    "activation_threshold": 10,
-    "syn_per_seg": 24,
-    "max_segs": 16,
+    "activation_threshold": 8,
+    "syn_per_seg": 20,
+    "max_segs": 12,
 }
 
 # ---------------------------------------------------------------------------
@@ -90,7 +110,10 @@ MODEL_DIR_NAME = "model.cglm"                         # persist/ store directory
 # the image as directories under /root so `import core...` works in-container.
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("numpy", "fastapi", "uvicorn[standard]", "requests", "kaggle")
+    # Pin FastAPI + Pydantic v2 together — unpinned installs produced a
+    # version mismatch where request-body models were misread as query params.
+    .pip_install("numpy", "fastapi==0.115.6", "pydantic>=2.5,<3",
+                 "uvicorn[standard]==0.34.0", "requests", "kaggle")
     .add_local_dir("core", "/root/core")
     .add_local_dir("persist", "/root/persist")
     .add_local_dir("benchmarks", "/root/benchmarks")
@@ -269,7 +292,7 @@ def fetch_corpus(max_chars: int = CORPUS_CONFIG["max_chars"]) -> dict:
 # Training with per-epoch metrics
 # ---------------------------------------------------------------------------
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=600, cpu=4)
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=420, cpu=4)
 def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
     import sys
     import random
@@ -303,8 +326,8 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
 
     def cb(epoch, total, burst, segs):
         t_acc = time.time()
-        t1, t3 = accuracy(model, test_seq, max_probes=200)
-        tr1, _ = accuracy(model, train_seq[:100], max_probes=100)
+        t1, t3 = accuracy(model, test_seq, max_probes=80)
+        tr1, _ = accuracy(model, train_seq[:60], max_probes=60)
         rec = {"epoch": epoch, "test_top1": t1, "test_top3": t3,
                "train_top1": tr1, "burst_rate": round(burst, 3),
                "segments": int(segs), "neuromod": model.stats()["neuromod"]}
@@ -386,7 +409,7 @@ def _write_notebook(epoch_metrics: list[dict]):
 # Bootstrap — called once after each deploy to fetch + train + record
 # ---------------------------------------------------------------------------
 
-@app.function(image=image, secrets=[kaggle_secret], volumes={_VOL_MOUNT: vol}, timeout=900)
+@app.function(image=image, secrets=[kaggle_secret], volumes={_VOL_MOUNT: vol}, timeout=420)
 def bootstrap(force: bool = False):
     """Idempotent post-deploy pipeline: dataset check → corpus sample → train → registry."""
     import time as _time
@@ -601,7 +624,7 @@ class WebApp:
 
     @modal.asgi_app()
     def serve(self):
-        from fastapi import FastAPI, Request
+        from fastapi import FastAPI
         from fastapi.responses import HTMLResponse, JSONResponse
 
         api = FastAPI(title="CGLM Chat")
@@ -611,23 +634,17 @@ class WebApp:
             return CHAT_HTML
 
         @api.post("/predict")
-        async def predict(request: Request):
-            body = await request.json()
-            tokens = body.get("tokens", [])
-            topn = int(body.get("topn", 5))
+        async def predict(body: PredictReq):
             if not self.model:
                 return JSONResponse({"error": "Model not loaded"}, status_code=503)
-            preds = self.model.predict_next(tokens, topn=topn)
+            preds = self.model.predict_next(body.tokens, topn=body.topn)
             return {"predictions": [[t, round(s, 4)] for t, s in preds]}
 
         @api.post("/generate")
-        async def generate(request: Request):
-            body = await request.json()
-            tokens = body.get("tokens", [])
-            n = int(body.get("n", 10))
+        async def generate(body: GenerateReq):
             if not self.model:
                 return JSONResponse({"error": "Model not loaded"}, status_code=503)
-            return {"generated": self.model.generate(tokens, n=n)}
+            return {"generated": self.model.generate(body.tokens, n=body.n)}
 
         @api.get("/similar")
         async def similar(word: str, k: int = 6):

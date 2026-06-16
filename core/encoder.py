@@ -163,11 +163,22 @@ class SemanticEncoder:
     # ── Encoding ──────────────────────────────────────────────────────────
 
     def encode(self, token: str) -> np.ndarray:
-        """Return sorted sparse fingerprint (int32).
-        Falls back to identity-only SDR for OOV tokens."""
+        """Return sorted sparse fingerprint of exactly `fp_bits` active bits.
+
+        For OOV tokens (not seen during fit) we build a deterministic full-width
+        fingerprint from the identity core padded with hashed bits — same width
+        as fitted words so feature SDRs stay uniform (required for stacking,
+        scoring, and persistence)."""
         f = self.fp.get(token)
         if f is None:
-            f = self.index_vec(token)
+            bits = set(int(b) for b in self.index_vec(token))     # identity core
+            h = hashlib.md5(f"{self.seed}:oov:{token}".encode()).digest()
+            pad = make_sdr(self.dim, self.fp_bits, int.from_bytes(h[:8], "little"))
+            for b in pad:
+                if len(bits) >= self.fp_bits:
+                    break
+                bits.add(int(b))
+            f = np.sort(np.array(sorted(bits)[: self.fp_bits], dtype=np.int32))
             self.fp[token] = f
         return f
 

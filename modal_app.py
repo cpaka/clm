@@ -99,11 +99,25 @@ MODEL_CONFIG = {
 
 app = modal.App(f"cglm-chat-{VERSION}")
 vol = modal.Volume.from_name("cglm-data", create_if_missing=True)
+# Shared live-training status — the train container writes progress here and the
+# web container reads it (no Volume commit/reload churn for fast UI polling).
+status_dict = modal.Dict.from_name("cglm-train-status", create_if_missing=True)
 _VOL_MOUNT = "/data"                                 # volume mount point (constant)
 VOL_PATH = Path(_VOL_MOUNT) / VERSION                # versioned subdirectory
 REGISTRY_PATH = Path(_VOL_MOUNT) / "registry.json"   # shared across all versions
 DATASET_PATH = Path(_VOL_MOUNT) / "datasets" / "wikisimple-all.txt"  # shared raw dataset
 MODEL_DIR_NAME = "model.cglm"                         # persist/ store directory
+
+
+def _set_status(**kw):
+    """Merge-update the live training status for this VERSION."""
+    cur = {}
+    try:
+        cur = dict(status_dict.get(VERSION) or {})
+    except Exception:
+        pass
+    cur.update(kw)
+    status_dict[VERSION] = cur
 
 # The model now lives in the modular `core/` + `persist/` packages, added to
 # the image as directories under /root so `import core...` works in-container.
@@ -294,9 +308,14 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
     from benchmarks.metrics import accuracy
     from persist.store import save_model
 
+    E = TRAIN_CONFIG["epochs"]
+    _set_status(phase="building", message="Building model…", epoch=0,
+                total_epochs=E, progress=0.0, metrics=[])
+
     VOL_PATH.mkdir(parents=True, exist_ok=True)
     corpus_path = VOL_PATH / "corpus.txt"
     if not corpus_path.exists():
+        _set_status(phase="error", message="corpus.txt not found — run fetch_corpus first")
         return {"error": "corpus.txt not found — run fetch_corpus first"}
 
     sequences = [s for s in _tokenize(corpus_path.read_text(encoding="utf-8")) if len(s) >= 2]
@@ -305,7 +324,6 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
 
     split = max(1, int(len(sequences) * test_fraction))
     test_seq, train_seq = sequences[:split], sequences[split:]
-    E = TRAIN_CONFIG["epochs"]
     print(f"[train] Train={len(train_seq)} Test={len(test_seq)} Epochs={E}")
 
     cfg = {**MODEL_CONFIG,
@@ -313,6 +331,8 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
            "periods": tuple(MODEL_CONFIG["periods"]),
            "encoder": "semantic"}
     model = HierarchicalCGLM(**cfg)
+
+    _set_status(phase="folding", message="Folding semantic fingerprints…")
 
     epoch_metrics: list[dict] = []
 
@@ -324,6 +344,10 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
                "train_top1": tr1, "burst_rate": round(burst, 3),
                "segments": int(segs), "neuromod": model.stats()["neuromod"]}
         epoch_metrics.append(rec)
+        _set_status(phase="learning", epoch=epoch, total_epochs=total,
+                    progress=round(epoch / total, 3),
+                    message=f"Epoch {epoch}/{total} — test top-1 {t1}%, burst {burst:.2f}",
+                    metrics=list(epoch_metrics))
         print(f"[train] epoch {epoch}/{total}: test_top1={t1}% test_top3={t3}% "
               f"train_top1={tr1}% burst={burst:.2f} segs={segs} "
               f"(eval {time.time()-t_acc:.1f}s)")
@@ -333,10 +357,13 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
                 progress_cb=cb)
     train_seconds = round(time.time() - t0, 1)
 
+    _set_status(phase="saving", message="Saving model…")
     print(f"[train] saving model → {VOL_PATH/MODEL_DIR_NAME}")
     save_model(model, str(VOL_PATH / MODEL_DIR_NAME))
     (VOL_PATH / "metrics.json").write_text(json.dumps(epoch_metrics, indent=2))
     vol.commit()
+    _set_status(phase="done", progress=1.0, message="Model ready.",
+                metrics=list(epoch_metrics))
 
     stats = model.stats()
     final = epoch_metrics[-1]
@@ -504,6 +531,15 @@ CHAT_HTML = r"""<!DOCTYPE html>
 
   <!-- DASHBOARD -->
   <section id="dash" class="view">
+    <div class="chartbox" id="trainbox">
+      <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
+        <button class="act" id="train-btn" style="background:#16a34a;color:#fff">Retrain (live)</button>
+        <span class="muted" id="train-msg">idle</span>
+      </div>
+      <div style="background:#0b1220;border-radius:9999px;height:8px;margin-top:0.7rem;overflow:hidden">
+        <div id="train-bar" style="height:100%;width:0%;background:#16a34a;transition:width .4s"></div>
+      </div>
+    </div>
     <div class="cards" id="cards"></div>
     <div class="chartbox"><h3>Accuracy per epoch</h3><canvas id="accChart" height="110"></canvas></div>
     <div class="chartbox"><h3>Surprise (burst rate) &amp; segment growth</h3><canvas id="growthChart" height="110"></canvas></div>
@@ -540,7 +576,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
   b.classList.add('active');
   $(b.dataset.view).classList.add('active');
-  if (b.dataset.view === 'dash') loadDashboard();
+  if (b.dataset.view === 'dash') { loadDashboard(); pollStatus(); }
 });
 
 /* ---- chat ---- */
@@ -581,6 +617,22 @@ async function loadStatus() {
 /* ---- dashboard ---- */
 let accChart, growthChart;
 function card(k, v) { return `<div class="card"><div class="k">${k}</div><div class="v">${v ?? '–'}</div></div>`; }
+function renderCharts(m) {
+  const ep = m.map(x => x.epoch);
+  const grid = { grid: { color: '#1e293b' }, ticks: { color: '#64748b' } };
+  if (accChart) accChart.destroy();
+  accChart = new Chart($('accChart'), { type:'line', data:{ labels: ep, datasets:[
+      {label:'test top-1', data: m.map(x=>x.test_top1), borderColor:'#38bdf8', tension:.3},
+      {label:'test top-3', data: m.map(x=>x.test_top3), borderColor:'#34d399', tension:.3},
+      {label:'train top-1', data: m.map(x=>x.train_top1), borderColor:'#a78bfa', borderDash:[5,4], tension:.3}
+    ]}, options:{ animation:false, plugins:{legend:{labels:{color:'#94a3b8'}}}, scales:{x:grid,y:grid} } });
+  if (growthChart) growthChart.destroy();
+  growthChart = new Chart($('growthChart'), { type:'line', data:{ labels: ep, datasets:[
+      {label:'burst rate', data: m.map(x=>x.burst_rate), borderColor:'#fb7185', yAxisID:'y', tension:.3},
+      {label:'segments', data: m.map(x=>x.segments), borderColor:'#fbbf24', yAxisID:'y1', tension:.3}
+    ]}, options:{ animation:false, plugins:{legend:{labels:{color:'#94a3b8'}}},
+      scales:{ x:grid, y:{...grid, position:'left'}, y1:{...grid, position:'right', grid:{drawOnChartArea:false}} } } });
+}
 async function loadDashboard() {
   let s = {};
   try { s = await (await fetch('/stats')).json(); } catch {}
@@ -590,25 +642,9 @@ async function loadDashboard() {
     card('memory MB', s.memory_mb ? s.memory_mb.toFixed(1) : '–'), card('neuromod', s.neuromod),
     card('replay', s.replay_size)
   ].join('');
-
   let m = [];
   try { m = await (await fetch('/metrics')).json(); } catch {}
-  const ep = m.map(x => x.epoch);
-  const mk = (ctx, cfg) => new Chart(ctx, cfg);
-  const grid = { grid: { color: '#1e293b' }, ticks: { color: '#64748b' } };
-  if (accChart) accChart.destroy();
-  accChart = mk($('accChart'), { type:'line', data:{ labels: ep, datasets:[
-      {label:'test top-1', data: m.map(x=>x.test_top1), borderColor:'#38bdf8', tension:.3},
-      {label:'test top-3', data: m.map(x=>x.test_top3), borderColor:'#34d399', tension:.3},
-      {label:'train top-1', data: m.map(x=>x.train_top1), borderColor:'#a78bfa', borderDash:[5,4], tension:.3}
-    ]}, options:{ plugins:{legend:{labels:{color:'#94a3b8'}}}, scales:{x:grid,y:grid} } });
-  if (growthChart) growthChart.destroy();
-  growthChart = mk($('growthChart'), { type:'line', data:{ labels: ep, datasets:[
-      {label:'burst rate', data: m.map(x=>x.burst_rate), borderColor:'#fb7185', yAxisID:'y', tension:.3},
-      {label:'segments', data: m.map(x=>x.segments), borderColor:'#fbbf24', yAxisID:'y1', tension:.3}
-    ]}, options:{ plugins:{legend:{labels:{color:'#94a3b8'}}},
-      scales:{ x:grid, y:{...grid, position:'left'}, y1:{...grid, position:'right', grid:{drawOnChartArea:false}} } } });
-
+  renderCharts(m);
   try {
     const rows = await (await fetch('/registry')).json();
     const cur = $('ver').textContent.replace('ver ','');
@@ -617,6 +653,35 @@ async function loadDashboard() {
     ).join('');
   } catch {}
 }
+
+/* ---- live training (UI polls every 10s) ---- */
+let trainTimer = null;
+const ACTIVE = ['building','folding','learning','saving'];
+function setBar(p, msg) { $('train-bar').style.width = Math.round((p||0)*100)+'%'; $('train-msg').textContent = msg || ''; }
+async function pollStatus() {
+  let st = {};
+  try { st = await (await fetch('/status')).json(); } catch { return; }
+  const active = ACTIVE.includes(st.phase);
+  if (active) { setBar(st.progress, st.message || st.phase); $('train-btn').disabled = true; $('train-btn').style.opacity = .5; }
+  if (st.metrics && st.metrics.length) renderCharts(st.metrics);
+  if (active && !trainTimer) trainTimer = setInterval(pollStatus, 10000);  // poll every ~10s
+  if (!active) {
+    if (trainTimer) { clearInterval(trainTimer); trainTimer = null; }
+    $('train-btn').disabled = false; $('train-btn').style.opacity = 1;
+    if (st.phase === 'done') {
+      setBar(1, 'Model ready — reloading…');
+      try { await fetch('/reload', {method:'POST'}); } catch {}
+      await loadStatus(); await loadDashboard(); setBar(0, 'idle');
+    } else if (st.phase === 'error') {
+      setBar(0, 'Error: ' + (st.message||''));
+    }
+  }
+}
+$('train-btn').onclick = async () => {
+  const r = await (await fetch('/train', {method:'POST'})).json();
+  if (!r.started) { setBar(0, r.reason || 'could not start'); }
+  pollStatus();
+};
 
 /* ---- explore: fingerprint visualisation ---- */
 async function fp(word) {
@@ -676,10 +741,16 @@ class WebApp:
     def load(self):
         import sys
         sys.path.insert(0, "/root")
-        from persist.store import load_model
-
         self.model = None
         self.metrics: list = []
+        self._load_model()
+
+    def _load_model(self, refresh: bool = False):
+        """(Re)load model + metrics from the Volume. `refresh` re-syncs the
+        Volume first so a model trained in another container becomes visible."""
+        from persist.store import load_model
+        if refresh:
+            vol.reload()
         model_dir = VOL_PATH / MODEL_DIR_NAME
         if (model_dir / "config.json").exists():
             try:
@@ -752,5 +823,42 @@ class WebApp:
         @api.get("/health")
         async def health():
             return {"ok": True, "version": VERSION}
+
+        # ---- live training -------------------------------------------------
+
+        @api.post("/train")
+        async def start_train():
+            """Spawn a training run in a separate container (non-blocking).
+            Refuses if one is already in progress."""
+            cur = {}
+            try:
+                cur = dict(status_dict.get(VERSION) or {})
+            except Exception:
+                pass
+            if cur.get("phase") in ("building", "folding", "learning", "saving"):
+                return {"started": False, "reason": "training already in progress"}
+            _set_status(phase="building", message="Starting…", epoch=0,
+                        progress=0.0, metrics=[])
+            train.spawn()
+            return {"started": True}
+
+        @api.get("/status")
+        async def status():
+            try:
+                return status_dict.get(VERSION) or {"phase": "idle"}
+            except Exception:
+                return {"phase": "idle"}
+
+        @api.post("/reload")
+        async def reload():
+            """Reload the freshly-trained model from the Volume into this
+            web container (call when /status reports phase == done)."""
+            self._load_model(refresh=True)
+            if not self.model:
+                return JSONResponse({"error": "no model on volume"}, status_code=503)
+            s = self.model.stats()
+            s["model_loaded"] = True
+            s["version"] = VERSION
+            return s
 
         return api

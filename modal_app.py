@@ -105,67 +105,67 @@ def _upsert_registry(entry: dict):
 
 
 # ---------------------------------------------------------------------------
-# Corpus: Simple English Wikipedia via Kaggle dataset
+# Corpus: Simple English Wikipedia via Kaggle REST API v1
 # Dataset: mikeortman/wikisimple — plain-text Simple English Wikipedia articles
+# Using REST v1 directly: the kaggle 2.x CLI switched to gRPC which rejects
+# old-format credentials; v1 REST works with both KGAT Bearer and Basic auth.
 # ---------------------------------------------------------------------------
 
 KAGGLE_DATASET = "mikeortman/wikisimple"
 
 @app.function(image=image, secrets=[kaggle_secret], volumes={_VOL_MOUNT: vol}, timeout=300)
 def fetch_corpus(max_chars: int = CORPUS_CONFIG["max_chars"]) -> dict:
+    import base64
+    import csv
+    import io
     import os
     import re
+    import requests
+    import zipfile
 
     VOL_PATH.mkdir(parents=True, exist_ok=True)
     out_path = VOL_PATH / "corpus.txt"
-    tmp_dir = Path("/tmp/kaggle_dl")
-    tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Configure Kaggle auth: support both KGAT token and classic key formats
+    # Build auth header: KGAT Bearer or Basic username:key
     api_token = os.environ.get("KAGGLE_API_TOKEN", "")
     username = os.environ.get("KAGGLE_USERNAME", "")
     key = os.environ.get("KAGGLE_KEY", "")
 
     if api_token.startswith("KGAT"):
-        os.environ["KAGGLE_API_TOKEN"] = api_token
+        auth_header = {"Authorization": f"Bearer {api_token}"}
     elif username and key:
-        # Write ~/.kaggle/kaggle.json for CLI
-        kaggle_dir = Path.home() / ".kaggle"
-        kaggle_dir.mkdir(exist_ok=True)
-        (kaggle_dir / "kaggle.json").write_text(
-            json.dumps({"username": username, "key": key})
-        )
-        (kaggle_dir / "kaggle.json").chmod(0o600)
+        creds = base64.b64encode(f"{username}:{key}".encode()).decode()
+        auth_header = {"Authorization": f"Basic {creds}"}
+    else:
+        raise RuntimeError("No Kaggle credentials found in environment")
 
-    result = subprocess.run(
-        ["kaggle", "datasets", "download", "-d", KAGGLE_DATASET, "-p", str(tmp_dir), "--unzip"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Kaggle download failed: {result.stderr}")
-    print(result.stdout)
+    # Download dataset zip via REST API v1
+    url = f"https://www.kaggle.com/api/v1/datasets/download/{KAGGLE_DATASET}"
+    print(f"Downloading {url} ...")
+    resp = requests.get(url, headers=auth_header, stream=True, allow_redirects=True, timeout=120)
+    resp.raise_for_status()
 
-    # Gather text from all .txt and .csv files
+    zip_bytes = io.BytesIO(resp.content)
     all_text: list[str] = []
     total_chars = 0
-    for f in sorted(tmp_dir.rglob("*")):
-        if total_chars >= max_chars:
-            break
-        if f.suffix == ".txt":
-            raw = f.read_text(errors="ignore")
-            # Each article is typically a paragraph; strip wikitext leftovers
-            raw = re.sub(r"={2,}[^=]*={2,}", " ", raw)
-            raw = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]*)\]\]", r"\1", raw)
-            raw = re.sub(r"\{\{[^}]*\}\}", " ", raw)
-            raw = re.sub(r"<[^>]+>", " ", raw)
-            raw = re.sub(r"\s+", " ", raw).strip()
-            if len(raw) > 80:
-                all_text.append(raw)
-                total_chars += len(raw)
-        elif f.suffix == ".csv":
-            import csv
-            with open(f, newline="", errors="ignore") as fh:
-                reader = csv.DictReader(fh)
+
+    with zipfile.ZipFile(zip_bytes) as zf:
+        for name in zf.namelist():
+            if total_chars >= max_chars:
+                break
+            if name.endswith(".txt"):
+                raw = zf.read(name).decode("utf-8", errors="ignore")
+                raw = re.sub(r"={2,}[^=]*={2,}", " ", raw)
+                raw = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]*)\]\]", r"\1", raw)
+                raw = re.sub(r"\{\{[^}]*\}\}", " ", raw)
+                raw = re.sub(r"<[^>]+>", " ", raw)
+                raw = re.sub(r"\s+", " ", raw).strip()
+                if len(raw) > 80:
+                    all_text.append(raw)
+                    total_chars += len(raw)
+            elif name.endswith(".csv"):
+                content = zf.read(name).decode("utf-8", errors="ignore")
+                reader = csv.DictReader(io.StringIO(content))
                 for row in reader:
                     if total_chars >= max_chars:
                         break

@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.pkl
+*.ipynb_checkpoints/
+.env
+.modal/
+dist/
+*.egg-info/

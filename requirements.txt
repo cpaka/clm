@@ -1,0 +1,5 @@
+modal
+numpy
+fastapi
+uvicorn[standard]
+requests

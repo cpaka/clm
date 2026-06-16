@@ -34,8 +34,7 @@ VERSION = "v1"
 # ---------------------------------------------------------------------------
 
 CORPUS_CONFIG = {
-    "name": "simple-wikipedia",
-    "n_articles": 300,    # → 2000 once inference confirmed
+    "name": "wikisimple (mikeortman/wikisimple)",
     "max_chars": 60_000,  # → 400_000 once inference confirmed
 }
 
@@ -69,7 +68,7 @@ REGISTRY_PATH = Path(_VOL_MOUNT) / "registry.json"  # shared across all versions
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("numpy", "fastapi", "uvicorn[standard]", "requests")
+    .pip_install("numpy", "fastapi", "uvicorn[standard]", "requests", "kaggle")
     .add_local_file("model_core.py", "/root/model_core.py")
 )
 
@@ -78,6 +77,8 @@ nb_image = (
     .pip_install("numpy", "jupyterlab", "matplotlib", "requests")
     .add_local_file("model_core.py", "/root/model_core.py")
 )
+
+kaggle_secret = modal.Secret.from_name("kaggle-credentials")
 
 # ---------------------------------------------------------------------------
 # Registry helpers (run inside Modal containers)
@@ -104,77 +105,81 @@ def _upsert_registry(entry: dict):
 
 
 # ---------------------------------------------------------------------------
-# Corpus: Simple English Wikipedia via public API
+# Corpus: Simple English Wikipedia via Kaggle dataset
+# Dataset: mikeortman/wikisimple — plain-text Simple English Wikipedia articles
 # ---------------------------------------------------------------------------
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=300)
-def fetch_corpus(n_articles: int = CORPUS_CONFIG["n_articles"],
-                 max_chars: int = CORPUS_CONFIG["max_chars"]) -> dict:
+KAGGLE_DATASET = "mikeortman/wikisimple"
+
+@app.function(image=image, secrets=[kaggle_secret], volumes={_VOL_MOUNT: vol}, timeout=300)
+def fetch_corpus(max_chars: int = CORPUS_CONFIG["max_chars"]) -> dict:
+    import os
     import re
-    import requests
 
     VOL_PATH.mkdir(parents=True, exist_ok=True)
     out_path = VOL_PATH / "corpus.txt"
-    api = "https://simple.wikipedia.org/w/api.php"
+    tmp_dir = Path("/tmp/kaggle_dl")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Configure Kaggle auth: support both KGAT token and classic key formats
+    api_token = os.environ.get("KAGGLE_API_TOKEN", "")
+    username = os.environ.get("KAGGLE_USERNAME", "")
+    key = os.environ.get("KAGGLE_KEY", "")
+
+    if api_token.startswith("KGAT"):
+        os.environ["KAGGLE_API_TOKEN"] = api_token
+    elif username and key:
+        # Write ~/.kaggle/kaggle.json for CLI
+        kaggle_dir = Path.home() / ".kaggle"
+        kaggle_dir.mkdir(exist_ok=True)
+        (kaggle_dir / "kaggle.json").write_text(
+            json.dumps({"username": username, "key": key})
+        )
+        (kaggle_dir / "kaggle.json").chmod(0o600)
+
+    result = subprocess.run(
+        ["kaggle", "datasets", "download", "-d", KAGGLE_DATASET, "-p", str(tmp_dir), "--unzip"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Kaggle download failed: {result.stderr}")
+    print(result.stdout)
+
+    # Gather text from all .txt and .csv files
     all_text: list[str] = []
     total_chars = 0
-    rvcontinue = None
-
-    while len(all_text) < n_articles and total_chars < max_chars:
-        params: dict = {
-            "action": "query",
-            "generator": "random",
-            "grnnamespace": 0,
-            "grnlimit": 20,
-            "prop": "revisions",
-            "rvprop": "content",
-            "rvslots": "main",
-            "formatversion": 2,
-            "format": "json",
-        }
-        if rvcontinue:
-            params["rvcontinue"] = rvcontinue
-
-        try:
-            resp = requests.get(api, params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            print(f"Wikipedia API error (skipping batch): {e}")
-            time.sleep(2)
-            rvcontinue = None
-            continue
-
-        for page in data.get("query", {}).get("pages", []):
-            if page.get("missing"):
-                continue
-            content = (
-                page.get("revisions", [{}])[0]
-                .get("slots", {})
-                .get("main", {})
-                .get("content", "")
-            )
-            content = re.sub(r"\{\{[^}]*\}\}", " ", content)
-            content = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]*)\]\]", r"\1", content)
-            content = re.sub(r"[=]{2,}[^=]*[=]{2,}", " ", content)
-            content = re.sub(r"<[^>]+>", " ", content)
-            content = re.sub(r"\s+", " ", content).strip()
-            if len(content) > 100:
-                all_text.append(content)
-                total_chars += len(content)
-
-        rvcontinue = data.get("continue", {}).get("rvcontinue")
-        if not rvcontinue:
-            rvcontinue = None
-
-        if total_chars >= max_chars or len(all_text) >= n_articles:
+    for f in sorted(tmp_dir.rglob("*")):
+        if total_chars >= max_chars:
             break
+        if f.suffix == ".txt":
+            raw = f.read_text(errors="ignore")
+            # Each article is typically a paragraph; strip wikitext leftovers
+            raw = re.sub(r"={2,}[^=]*={2,}", " ", raw)
+            raw = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]*)\]\]", r"\1", raw)
+            raw = re.sub(r"\{\{[^}]*\}\}", " ", raw)
+            raw = re.sub(r"<[^>]+>", " ", raw)
+            raw = re.sub(r"\s+", " ", raw).strip()
+            if len(raw) > 80:
+                all_text.append(raw)
+                total_chars += len(raw)
+        elif f.suffix == ".csv":
+            import csv
+            with open(f, newline="", errors="ignore") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    if total_chars >= max_chars:
+                        break
+                    text = row.get("text") or row.get("Text") or row.get("content") or ""
+                    text = text.strip()
+                    if len(text) > 80:
+                        all_text.append(text)
+                        total_chars += len(text)
 
     corpus = " ".join(all_text)[:max_chars]
     out_path.write_text(corpus, encoding="utf-8")
     vol.commit()
     chars = len(corpus)
-    print(f"Corpus: {len(all_text)} articles, {chars:,} chars → {out_path}")
+    print(f"Corpus: {len(all_text)} segments, {chars:,} chars → {out_path}")
     return {"articles": len(all_text), "chars": chars}
 
 

@@ -24,7 +24,6 @@ Versioning:
 from __future__ import annotations
 import datetime
 import json
-import subprocess
 import time
 from pathlib import Path
 
@@ -117,13 +116,6 @@ image = (
     .add_local_dir("core", "/root/core")
     .add_local_dir("persist", "/root/persist")
     .add_local_dir("benchmarks", "/root/benchmarks")
-)
-
-nb_image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install("numpy", "jupyterlab", "matplotlib", "requests")
-    .add_local_dir("core", "/root/core")
-    .add_local_dir("persist", "/root/persist")
 )
 
 kaggle_secret = modal.Secret.from_name("kaggle-credentials")
@@ -344,7 +336,6 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
     print(f"[train] saving model → {VOL_PATH/MODEL_DIR_NAME}")
     save_model(model, str(VOL_PATH / MODEL_DIR_NAME))
     (VOL_PATH / "metrics.json").write_text(json.dumps(epoch_metrics, indent=2))
-    _write_notebook(epoch_metrics)
     vol.commit()
 
     stats = model.stats()
@@ -357,52 +348,6 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
         "total_seconds": train_seconds,
         "epoch_metrics": epoch_metrics,
     }
-
-
-def _write_notebook(epoch_metrics: list[dict]):
-    vol_str = str(VOL_PATH)
-    cells = [
-        {"cell_type": "markdown", "metadata": {},
-         "source": [f"# CGLM Analytics — {VERSION}\n", "Hierarchical brain-architecture model."]},
-        {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
-         "source": [
-            "import json, sys\n",
-            "sys.path.insert(0, '/root')\n",
-            "import matplotlib.pyplot as plt\n\n",
-            f"metrics = {json.dumps(epoch_metrics)}\n",
-            "epochs = [m['epoch'] for m in metrics]\n",
-            "top1 = [m['test_top1'] for m in metrics]\n",
-            "top3 = [m['test_top3'] for m in metrics]\n",
-            "tr1  = [m['train_top1'] for m in metrics]\n\n",
-            "fig, axes = plt.subplots(1, 2, figsize=(12, 4))\n",
-            "axes[0].plot(epochs, top1, 'o-', label='test top-1')\n",
-            "axes[0].plot(epochs, top3, 's-', label='test top-3')\n",
-            "axes[0].plot(epochs, tr1, '^--', label='train top-1')\n",
-            f"axes[0].set_title('Accuracy — {VERSION}'); axes[0].legend()\n",
-            "axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('%')\n",
-            "burst = [m['burst_rate'] for m in metrics]\n",
-            "segs  = [m['segments'] for m in metrics]\n",
-            "axes[1].plot(epochs, burst, 'o-', label='burst rate')\n",
-            "ax2 = axes[1].twinx(); ax2.plot(epochs, segs, 's-', color='tab:red', label='segments')\n",
-            f"axes[1].set_title('Surprise & Growth — {VERSION}'); axes[1].set_xlabel('Epoch')\n",
-            "plt.tight_layout()\n",
-            f"plt.savefig('{vol_str}/training_curves.png', dpi=100)\n",
-            "plt.show()\n",
-         ]},
-        {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
-         "source": [
-            "import sys; sys.path.insert(0, '/root')\n",
-            "from persist.store import load_model\n",
-            f"model = load_model('{vol_str}/{MODEL_DIR_NAME}')\n",
-            "for p in ['the capital of', 'science is', 'history of the', 'water is']:\n",
-            "    print(' '.join(model.generate(p.split(), n=8)))\n",
-         ]},
-    ]
-    nb = {"nbformat": 4, "nbformat_minor": 5,
-          "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-                       "language_info": {"name": "python", "version": "3.11.0"}},
-          "cells": cells}
-    (VOL_PATH / "analytics.ipynb").write_text(json.dumps(nb, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -477,122 +422,246 @@ CHAT_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CGLM Chat</title>
+<title>CGLM Console</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; height: 100vh; display: flex; flex-direction: column; }
-  header { padding: 1rem 1.5rem; background: #1e293b; border-bottom: 1px solid #334155; display: flex; align-items: center; gap: 1rem; }
-  header h1 { font-size: 1.2rem; font-weight: 700; color: #38bdf8; }
+  body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; display: flex; flex-direction: column; }
+  header { padding: 0.9rem 1.5rem; background: #1e293b; border-bottom: 1px solid #334155; display: flex; align-items: center; gap: 1rem; }
+  header h1 { font-size: 1.15rem; font-weight: 700; color: #38bdf8; }
   #ver { font-size: 0.75rem; color: #475569; }
-  #status-badge { font-size: 0.75rem; padding: 2px 8px; border-radius: 9999px; background: #334155; color: #94a3b8; margin-left: auto; }
+  nav { display: flex; gap: 0.25rem; margin-left: 1rem; }
+  nav button { background: transparent; color: #94a3b8; border: none; padding: 0.4rem 0.9rem; border-radius: 0.6rem; cursor: pointer; font-size: 0.85rem; font-weight: 600; }
+  nav button.active { background: #0ea5e9; color: #fff; }
+  nav button:hover:not(.active) { background: #334155; color: #e2e8f0; }
+  #status-badge { font-size: 0.75rem; padding: 2px 10px; border-radius: 9999px; background: #334155; color: #94a3b8; margin-left: auto; }
   #status-badge.ready { background: #065f46; color: #6ee7b7; }
-  main { flex: 1; display: flex; flex-direction: column; max-width: 800px; width: 100%; margin: 0 auto; padding: 1rem; gap: 0.75rem; overflow: hidden; }
-  #messages { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.75rem; padding-right: 4px; }
+  main { flex: 1; width: 100%; max-width: 980px; margin: 0 auto; padding: 1rem; }
+  .view { display: none; }
+  .view.active { display: block; }
+
+  /* chat */
+  #chat { display: flex; flex-direction: column; gap: 0.75rem; height: calc(100vh - 140px); }
+  #messages { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.75rem; }
   .msg { padding: 0.6rem 0.9rem; border-radius: 0.75rem; max-width: 85%; line-height: 1.5; font-size: 0.95rem; }
   .msg.user { align-self: flex-end; background: #1d4ed8; color: #eff6ff; }
   .msg.bot { align-self: flex-start; background: #1e293b; border: 1px solid #334155; }
   .msg.bot .candidates { margin-top: 0.4rem; font-size: 0.8rem; color: #64748b; }
   #controls { display: flex; gap: 0.5rem; }
-  #prompt { flex: 1; padding: 0.6rem 0.9rem; background: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; color: #e2e8f0; font-size: 0.95rem; outline: none; }
-  #prompt:focus { border-color: #38bdf8; }
-  button { padding: 0.6rem 1.1rem; border: none; border-radius: 0.75rem; cursor: pointer; font-size: 0.9rem; font-weight: 600; transition: opacity 0.15s; }
-  button:hover { opacity: 0.85; }
+  input { padding: 0.6rem 0.9rem; background: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; color: #e2e8f0; font-size: 0.95rem; outline: none; }
+  input:focus { border-color: #38bdf8; }
+  #prompt, #wordA, #wordB { flex: 1; }
+  button.act { padding: 0.6rem 1.1rem; border: none; border-radius: 0.75rem; cursor: pointer; font-size: 0.9rem; font-weight: 600; }
+  button.act:hover { opacity: 0.85; }
   #send-btn { background: #0ea5e9; color: #fff; }
   #gen-btn  { background: #7c3aed; color: #fff; }
-  #metrics-panel { background: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; padding: 0.6rem 1rem; font-size: 0.8rem; color: #94a3b8; display: flex; gap: 1.5rem; flex-wrap: wrap; }
-  #metrics-panel span { color: #38bdf8; font-weight: 600; }
-  #history { background: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; padding: 0.6rem 1rem; font-size: 0.75rem; color: #64748b; max-height: 80px; overflow-y: auto; }
-  #history table { width: 100%; border-collapse: collapse; }
-  #history th { color: #475569; font-weight: 600; text-align: left; padding: 1px 8px; }
-  #history td { padding: 1px 8px; }
-  #history tr.current td { color: #e2e8f0; }
+  #fp-btn   { background: #0ea5e9; color: #fff; }
+
+  /* cards + charts */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; padding: 0.8rem 1rem; }
+  .card .k { font-size: 0.72rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; }
+  .card .v { font-size: 1.4rem; font-weight: 700; color: #38bdf8; margin-top: 2px; }
+  .chartbox { background: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; padding: 1rem; margin-bottom: 1rem; }
+  .chartbox h3 { font-size: 0.85rem; color: #94a3b8; margin-bottom: 0.5rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+  th { color: #475569; font-weight: 600; text-align: left; padding: 4px 8px; }
+  td { padding: 4px 8px; color: #94a3b8; border-top: 1px solid #1e293b; }
+  tr.current td { color: #e2e8f0; }
+
+  /* explore / fingerprint */
+  .exrow { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+  #fpgrid { display: block; background: #0b1220; border: 1px solid #334155; border-radius: 0.6rem; }
+  .legend { display: flex; gap: 1.2rem; font-size: 0.8rem; color: #94a3b8; margin: 0.6rem 0; flex-wrap: wrap; }
+  .legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 5px; vertical-align: middle; }
+  .neigh { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.6rem; }
+  .neigh span { background: #1e293b; border: 1px solid #334155; border-radius: 9999px; padding: 3px 10px; font-size: 0.8rem; cursor: pointer; }
+  .neigh span:hover { border-color: #38bdf8; }
+  .muted { color: #64748b; font-size: 0.8rem; }
 </style>
 </head>
 <body>
 <header>
-  <h1>CGLM Chat</h1>
+  <h1>CGLM Console</h1>
   <span id="ver"></span>
+  <nav>
+    <button data-view="chat" class="active">Chat</button>
+    <button data-view="dash">Dashboard</button>
+    <button data-view="explore">Explore</button>
+  </nav>
   <div id="status-badge">loading&hellip;</div>
 </header>
 <main>
-  <div id="messages"></div>
-  <div id="metrics-panel">
-    vocab: <span id="m-vocab">&ndash;</span>
-    &nbsp;levels: <span id="m-levels">&ndash;</span>
-    &nbsp;segments: <span id="m-segs">&ndash;</span>
-    &nbsp;test top-1: <span id="m-top1">&ndash;</span>
-    &nbsp;test top-3: <span id="m-top3">&ndash;</span>
-  </div>
-  <div id="history"><table><thead><tr><th>ver</th><th>corpus</th><th>epochs</th><th>seqs</th><th>top-1</th><th>top-3</th><th>deployed</th></tr></thead><tbody id="reg-body"></tbody></table></div>
-  <div id="controls">
-    <input id="prompt" placeholder="Type a phrase&hellip;" autocomplete="off"/>
-    <button id="send-btn">Predict</button>
-    <button id="gen-btn">Generate</button>
-  </div>
+  <!-- CHAT -->
+  <section id="chat" class="view active">
+    <div id="messages"></div>
+    <div id="controls">
+      <input id="prompt" placeholder="Type a phrase&hellip;" autocomplete="off"/>
+      <button class="act" id="send-btn">Predict</button>
+      <button class="act" id="gen-btn">Generate</button>
+    </div>
+  </section>
+
+  <!-- DASHBOARD -->
+  <section id="dash" class="view">
+    <div class="cards" id="cards"></div>
+    <div class="chartbox"><h3>Accuracy per epoch</h3><canvas id="accChart" height="110"></canvas></div>
+    <div class="chartbox"><h3>Surprise (burst rate) &amp; segment growth</h3><canvas id="growthChart" height="110"></canvas></div>
+    <div class="chartbox"><h3>Deployment history</h3>
+      <table><thead><tr><th>ver</th><th>corpus</th><th>epochs</th><th>seqs</th><th>top-1</th><th>top-3</th><th>deployed</th></tr></thead>
+      <tbody id="reg-body"></tbody></table>
+    </div>
+  </section>
+
+  <!-- EXPLORE -->
+  <section id="explore" class="view">
+    <p class="muted">Visualise a word's sparse fingerprint (SDR). Add a second word to see shared vs unique bits — that overlap is what drives semantic generalisation.</p>
+    <div class="exrow">
+      <input id="wordA" placeholder="word (e.g. water)" autocomplete="off"/>
+      <input id="wordB" placeholder="compare with (optional)" autocomplete="off"/>
+      <button class="act" id="fp-btn">Show</button>
+    </div>
+    <div class="legend">
+      <span><i style="background:#38bdf8"></i><b id="lblA">A</b> only: <b id="cntA">0</b></span>
+      <span><i style="background:#f472b6"></i><b id="lblB">B</b> only: <b id="cntB">0</b></span>
+      <span><i style="background:#fbbf24"></i>shared: <b id="cntShared">0</b></span>
+      <span class="muted" id="fpmeta"></span>
+    </div>
+    <canvas id="fpgrid" width="640" height="640"></canvas>
+    <div class="neigh" id="neigh"></div>
+  </section>
 </main>
 <script>
 const $ = id => document.getElementById(id);
-const messages = $('messages');
-const promptEl = $('prompt');
 
+/* ---- tab switching ---- */
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  b.classList.add('active');
+  $(b.dataset.view).classList.add('active');
+  if (b.dataset.view === 'dash') loadDashboard();
+});
+
+/* ---- chat ---- */
+const messages = $('messages'), promptEl = $('prompt');
 function addMsg(role, text, sub) {
-  const el = document.createElement('div');
-  el.className = 'msg ' + role;
-  el.textContent = text;
+  const el = document.createElement('div'); el.className = 'msg ' + role; el.textContent = text;
   if (sub) { const s = document.createElement('div'); s.className = 'candidates'; s.textContent = sub; el.appendChild(s); }
-  messages.appendChild(el);
-  messages.scrollTop = messages.scrollHeight;
+  messages.appendChild(el); messages.scrollTop = messages.scrollHeight;
 }
-
-async function loadStatus() {
-  try {
-    const r = await fetch('/stats'); const d = await r.json();
-    $('ver').textContent = d.version ? 'ver ' + d.version : '';
-    if (d.model_loaded) {
-      $('status-badge').textContent = 'model ready'; $('status-badge').className = 'ready';
-    } else { $('status-badge').textContent = d.status || 'no model'; }
-    $('m-vocab').textContent = d.vocab ?? '–';
-    $('m-levels').textContent = d.levels ?? '–';
-    $('m-segs').textContent = d.segments_l0 ?? '–';
-  } catch {}
-  try {
-    const r = await fetch('/metrics'); const d = await r.json();
-    if (d.length) { const l = d[d.length-1]; $('m-top1').textContent = l.test_top1+'%'; $('m-top3').textContent = l.test_top3+'%'; }
-  } catch {}
-  try {
-    const r = await fetch('/registry'); const rows = await r.json();
-    const tbody = $('reg-body'); tbody.innerHTML = '';
-    rows.slice().reverse().forEach(row => {
-      const tr = document.createElement('tr');
-      if (row.version === $('ver').textContent.replace('ver ','')) tr.className = 'current';
-      tr.innerHTML = `<td>${row.version}</td><td>${row.corpus_name||'–'}</td><td>${row.epochs||'–'}</td><td>${row.max_sequences||'–'}</td><td>${row.test_top1??'–'}%</td><td>${row.test_top3??'–'}%</td><td>${(row.deployed_at||'').slice(0,10)}</td>`;
-      tbody.appendChild(tr);
-    });
-  } catch {}
-}
-
 $('send-btn').onclick = async () => {
-  const text = promptEl.value.trim(); if (!text) return;
-  addMsg('user', text); promptEl.value = '';
+  const t = promptEl.value.trim(); if (!t) return; addMsg('user', t); promptEl.value = '';
   try {
-    const r = await fetch('/predict', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({tokens: text.toLowerCase().split(/\s+/), topn: 5}) });
+    const r = await fetch('/predict', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({tokens: t.toLowerCase().split(/\s+/), topn: 5})});
     const d = await r.json();
     if (d.predictions?.length) { const top = d.predictions[0][0]; const rest = d.predictions.slice(1).map(p=>p[0]).join(', '); addMsg('bot','→ '+top, rest?'also: '+rest:''); }
     else addMsg('bot','(no prediction)');
   } catch(e) { addMsg('bot','Error: '+e.message); }
 };
-
 $('gen-btn').onclick = async () => {
-  const text = promptEl.value.trim(); if (!text) return;
-  addMsg('user','[generate] '+text); promptEl.value = '';
+  const t = promptEl.value.trim(); if (!t) return; addMsg('user','[generate] '+t); promptEl.value = '';
   try {
-    const r = await fetch('/generate', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({tokens: text.toLowerCase().split(/\s+/), n: 15}) });
-    const d = await r.json();
-    addMsg('bot', d.generated ? d.generated.join(' ') : '(no output)');
+    const r = await fetch('/generate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({tokens: t.toLowerCase().split(/\s+/), n: 15})});
+    const d = await r.json(); addMsg('bot', d.generated ? d.generated.join(' ') : '(no output)');
   } catch(e) { addMsg('bot','Error: '+e.message); }
 };
+promptEl.addEventListener('keydown', e => { if (e.key==='Enter') { e.preventDefault(); $('send-btn').click(); } });
 
-promptEl.addEventListener('keydown', e => { if (e.key==='Enter'&&!e.shiftKey) { e.preventDefault(); $('send-btn').click(); } });
+/* ---- header status (poll) ---- */
+async function loadStatus() {
+  try {
+    const d = await (await fetch('/stats')).json();
+    $('ver').textContent = d.version ? 'ver ' + d.version : '';
+    if (d.model_loaded) { $('status-badge').textContent = 'model ready'; $('status-badge').className = 'ready'; }
+    else { $('status-badge').textContent = d.status || 'no model'; }
+  } catch {}
+}
+
+/* ---- dashboard ---- */
+let accChart, growthChart;
+function card(k, v) { return `<div class="card"><div class="k">${k}</div><div class="v">${v ?? '–'}</div></div>`; }
+async function loadDashboard() {
+  let s = {};
+  try { s = await (await fetch('/stats')).json(); } catch {}
+  $('cards').innerHTML = [
+    card('vocab', s.vocab), card('levels', s.levels), card('units/level', s.units_per_level),
+    card('segments', (s.segments_l0||0).toLocaleString()), card('synapses', (s.synapses_l0||0).toLocaleString()),
+    card('memory MB', s.memory_mb ? s.memory_mb.toFixed(1) : '–'), card('neuromod', s.neuromod),
+    card('replay', s.replay_size)
+  ].join('');
+
+  let m = [];
+  try { m = await (await fetch('/metrics')).json(); } catch {}
+  const ep = m.map(x => x.epoch);
+  const mk = (ctx, cfg) => new Chart(ctx, cfg);
+  const grid = { grid: { color: '#1e293b' }, ticks: { color: '#64748b' } };
+  if (accChart) accChart.destroy();
+  accChart = mk($('accChart'), { type:'line', data:{ labels: ep, datasets:[
+      {label:'test top-1', data: m.map(x=>x.test_top1), borderColor:'#38bdf8', tension:.3},
+      {label:'test top-3', data: m.map(x=>x.test_top3), borderColor:'#34d399', tension:.3},
+      {label:'train top-1', data: m.map(x=>x.train_top1), borderColor:'#a78bfa', borderDash:[5,4], tension:.3}
+    ]}, options:{ plugins:{legend:{labels:{color:'#94a3b8'}}}, scales:{x:grid,y:grid} } });
+  if (growthChart) growthChart.destroy();
+  growthChart = mk($('growthChart'), { type:'line', data:{ labels: ep, datasets:[
+      {label:'burst rate', data: m.map(x=>x.burst_rate), borderColor:'#fb7185', yAxisID:'y', tension:.3},
+      {label:'segments', data: m.map(x=>x.segments), borderColor:'#fbbf24', yAxisID:'y1', tension:.3}
+    ]}, options:{ plugins:{legend:{labels:{color:'#94a3b8'}}},
+      scales:{ x:grid, y:{...grid, position:'left'}, y1:{...grid, position:'right', grid:{drawOnChartArea:false}} } } });
+
+  try {
+    const rows = await (await fetch('/registry')).json();
+    const cur = $('ver').textContent.replace('ver ','');
+    $('reg-body').innerHTML = rows.slice().reverse().map(r =>
+      `<tr class="${r.version===cur?'current':''}"><td>${r.version}</td><td>${r.corpus_name? r.corpus_name.split(' ')[0] : '–'}</td><td>${r.epochs??'–'}</td><td>${r.max_sequences??r.train_sequences??'–'}</td><td>${r.test_top1??'–'}%</td><td>${r.test_top3??'–'}%</td><td>${(r.deployed_at||'').slice(0,10)}</td></tr>`
+    ).join('');
+  } catch {}
+}
+
+/* ---- explore: fingerprint visualisation ---- */
+async function fp(word) {
+  const r = await fetch('/fingerprint?word=' + encodeURIComponent(word));
+  if (!r.ok) return null;
+  return await r.json();
+}
+function drawGrid(dim, setA, setB) {
+  const cv = $('fpgrid'), ctx = cv.getContext('2d');
+  const cols = Math.ceil(Math.sqrt(dim)), rows = Math.ceil(dim / cols);
+  const cell = Math.floor(cv.width / cols), pad = 1;
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  cv.height = rows * cell;
+  for (let i = 0; i < dim; i++) {
+    const x = (i % cols) * cell, y = Math.floor(i / cols) * cell;
+    const inA = setA.has(i), inB = setB.has(i);
+    let col = '#172033';
+    if (inA && inB) col = '#fbbf24'; else if (inA) col = '#38bdf8'; else if (inB) col = '#f472b6';
+    ctx.fillStyle = col;
+    ctx.fillRect(x + pad, y + pad, cell - 2*pad, cell - 2*pad);
+  }
+}
+async function showFingerprint() {
+  const a = $('wordA').value.trim().toLowerCase(); if (!a) return;
+  const b = $('wordB').value.trim().toLowerCase();
+  const fa = await fp(a); if (!fa) { $('fpmeta').textContent = 'model not loaded'; return; }
+  const fb = b ? await fp(b) : null;
+  const setA = new Set(fa.bits), setB = new Set(fb ? fb.bits : []);
+  let shared = 0; setA.forEach(x => { if (setB.has(x)) shared++; });
+  $('lblA').textContent = a; $('lblB').textContent = b || 'B';
+  $('cntA').textContent = setA.size - shared; $('cntB').textContent = Math.max(0, setB.size - shared);
+  $('cntShared').textContent = shared;
+  $('fpmeta').textContent = `dim=${fa.dim}, |${a}|=${setA.size}${fa.fitted?'':' (OOV)'}` + (fb ? `, |${b}|=${setB.size}${fb.fitted?'':' (OOV)'}` : '');
+  drawGrid(fa.dim, setA, setB);
+  // neighbours of A
+  try {
+    const nb = await (await fetch('/similar?word=' + encodeURIComponent(a) + '&k=10')).json();
+    $('neigh').innerHTML = (nb.neighbours||[]).map(([t,o]) => `<span data-w="${t}">${t} · ${o}</span>`).join('');
+    document.querySelectorAll('#neigh span').forEach(s => s.onclick = () => { $('wordB').value = s.dataset.w; showFingerprint(); });
+  } catch {}
+}
+$('fp-btn').onclick = showFingerprint;
+$('wordA').addEventListener('keydown', e => { if (e.key==='Enter') showFingerprint(); });
+$('wordB').addEventListener('keydown', e => { if (e.key==='Enter') showFingerprint(); });
+
 loadStatus();
 setInterval(loadStatus, 30000);
 </script>
@@ -653,6 +722,12 @@ class WebApp:
             return {"word": word,
                     "neighbours": [[t, o] for t, o in self.model.similar(word, k=k)]}
 
+        @api.get("/fingerprint")
+        async def fingerprint(word: str):
+            if not self.model:
+                return JSONResponse({"error": "Model not loaded"}, status_code=503)
+            return self.model.fingerprint(word)
+
         @api.get("/stats")
         async def stats():
             if not self.model:
@@ -679,18 +754,3 @@ class WebApp:
             return {"ok": True, "version": VERSION}
 
         return api
-
-
-# ---------------------------------------------------------------------------
-# JupyterLab analytics notebook
-# ---------------------------------------------------------------------------
-
-@app.function(image=nb_image, volumes={_VOL_MOUNT: vol}, timeout=3600)
-@modal.web_server(8888)
-def notebook():
-    subprocess.Popen([
-        "jupyter", "lab",
-        "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root",
-        "--NotebookApp.token=", "--NotebookApp.password=",
-        "--notebook-dir=/data",
-    ])

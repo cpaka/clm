@@ -546,6 +546,20 @@ class HierarchicalCGLM:
         scored.sort(key=lambda kv: -kv[1])
         return scored[:k]
 
+    def fingerprint(self, word: str) -> dict:
+        """Active SDR bits for `word` (for UI visualisation).
+
+        Returns {word, bits, dim, fitted} where `bits` is the sorted active-bit
+        list and `fitted` is True if the word was seen during encoder fitting
+        (vs an OOV fingerprint)."""
+        self._build()
+        enc = self._encoders[0] if self._encoders else self.levels[0].units[0].enc
+        w = word.lower()
+        fitted = bool(getattr(enc, "fp", {}).get(w) is not None) if hasattr(enc, "fp") else True
+        bits = enc.encode(w)
+        return {"word": w, "bits": [int(b) for b in bits],
+                "dim": int(enc.dim), "fitted": fitted}
+
     # ── Utilities ─────────────────────────────────────────────────────────────
 
     def _n_segments(self) -> int:

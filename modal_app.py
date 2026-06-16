@@ -373,7 +373,7 @@ def _write_notebook(epoch_metrics: list[dict]):
 # Bootstrap — called once after each deploy to fetch + train + record
 # ---------------------------------------------------------------------------
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=660)
+@app.function(image=image, secrets=[kaggle_secret], volumes={_VOL_MOUNT: vol}, timeout=660)
 def bootstrap(force: bool = False):
     """Idempotent post-deploy pipeline: corpus → train → registry entry."""
     VOL_PATH.mkdir(parents=True, exist_ok=True)

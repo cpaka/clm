@@ -1,5 +1,5 @@
 """
-core/hierarchy.py — Hierarchical Cortical Grid Language Model.
+core/hierarchy.py — Hierarchical Cortical Language Model.
 
 Architecture
 ============
@@ -16,7 +16,7 @@ Architecture
                 │ Level 2 (stride=16, clause-level) │
                 └──────────────────────────────────┘
 
-Each level is a voting ensemble of `n_units` CGLM units (Thousand-Brains
+Each level is a voting ensemble of `n_units` CLM units (Thousand-Brains
 consensus). Higher levels fire at coarser time-scales, learning phrase and
 clause structure without explicit parse trees.
 
@@ -83,9 +83,9 @@ class SparseProjection:
         return dense_to_sparse(kwta(scores, self.out_k)).astype(np.int32)
 
 
-# ── One CGLM unit (encoder + grid + column + inverted index) ─────────────────
+# ── One CLM unit (encoder + grid + column + inverted index) ─────────────────
 
-class CGLMUnit:
+class CLMUnit:
     """
     Atomic prediction unit: one encoder, one grid, one column.
     Used as a building block inside each hierarchy level.
@@ -185,7 +185,7 @@ class CGLMUnit:
 
 class HierarchyLevel:
     """
-    A voting ensemble of `n_units` CGLM units at one temporal scale.
+    A voting ensemble of `n_units` CLM units at one temporal scale.
 
     Level 0 works directly on tokens.
     Level ≥ 1 works on projected feature SDRs produced by the level below.
@@ -209,8 +209,8 @@ class HierarchyLevel:
         self.col_dim = col_dim
         self.w = w
 
-        self.units: list[CGLMUnit] = [
-            CGLMUnit(
+        self.units: list[CLMUnit] = [
+            CLMUnit(
                 col_dim=col_dim,
                 w=w,
                 cells_per_col=cells_per_col,
@@ -227,16 +227,16 @@ class HierarchyLevel:
         return self.units[0].col.n_cells
 
 
-# ── Hierarchical CGLM ─────────────────────────────────────────────────────────
+# ── Hierarchical CLM ─────────────────────────────────────────────────────────
 
-class HierarchicalCGLM:
+class HierarchicalCLM:
     """
     Multi-level cortical hierarchy with voting, k-WTA, neuromodulation
     and hippocampal replay.
 
     Parameters
     ----------
-    n_levels      : number of hierarchy levels (1 = flat, like original CGLM)
+    n_levels      : number of hierarchy levels (1 = flat, like original CLM)
     strides       : temporal stride per level (list of len n_levels)
     n_units       : voting columns per level
     col_dim       : mini-column count (= encoder SDR width)

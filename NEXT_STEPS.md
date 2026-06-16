@@ -1,4 +1,4 @@
-# CGLM — Next Steps
+# CLM — Next Steps
 
 Roadmap for scaling training (faster / parallel) and continual learning
 (absorb more data without retraining from scratch). Each item builds on the
@@ -6,9 +6,11 @@ existing code (`core/`, `persist/`, `modal_app.py`) — none requires a rewrite.
 
 ## Status (where we left off)
 
-The brain-architecture CGLM is **live on Modal** as `cglm-chat-v2`:
-- URL: https://christophe-paka--cglm-chat-v2-webapp-serve.modal.run
-- Endpoints verified: `/predict`, `/generate`, `/similar`, `/stats`, `/health`.
+The brain-architecture CLM is **live on Modal** as `clm-chat-v3`:
+- URL: https://christophe-paka--clm-chat-v3-webapp-serve.modal.run
+- Endpoints: `/predict`, `/generate`, `/similar`, `/fingerprint`, `/stats`,
+  `/metrics`, `/registry`, `/train`, `/status`, `/reload`, `/health`.
+- UI: tabbed console (Chat | Dashboard | Explore) with live training (~10s polling).
 
 Three deploy fixes are committed and pushed to GitHub (`main`), matching the
 live deployment:
@@ -34,10 +36,10 @@ Current config (`modal_app.py`): `col_dim=1024`, `n_units=3`, 2 levels,
 ## A. Train faster / in parallel
 
 ### 1. Fan out the voting units across containers (free n_units× speedup)
-Each `CGLMUnit` is fully independent (own encoder seed, grid, column); units only
+Each `CLMUnit` is fully independent (own encoder seed, grid, column); units only
 interact at vote time in `predict_next`. Train the units in separate Modal
 containers with `train.map(...)` / `.spawn()`, then assemble into one
-`HierarchicalCGLM` and save. No accuracy change, ~3× wall-clock.
+`HierarchicalCLM` and save. No accuracy change, ~3× wall-clock.
 
 - Touch: `modal_app.py` (new `train_unit` function + assembler), `core/hierarchy.py`
   (helper to build a model from pre-trained units).
@@ -86,8 +88,8 @@ warm-starts and keeps growing synapses (covered by `test_warm_start_training`).
 Make continual learning robust with:
 
 ### 6. A streaming ingest job
-Scheduled Modal function: load `model.cglm` → train on the new corpus delta →
-save. Use a `modal` cron schedule. The `.cglm` store is tiny (~0.1 MB compressed),
+Scheduled Modal function: load `model.clm` → train on the new corpus delta →
+save. Use a `modal` cron schedule. The `.clm` store is tiny (~0.1 MB compressed),
 so checkpoint-per-batch is cheap.
 
 - Touch: `modal_app.py` (new `ingest` function + schedule).
@@ -117,7 +119,7 @@ that retains old knowledge while absorbing new.
 ### 9. Grow capacity by adding units/levels, not resizing
 `col_dim`, `cells_per_col`, `max_segs` are fixed array dimensions — can't enlarge
 in place without migration. The clean "add brain capacity" move is to **append new
-`CGLMUnit`s** (train fresh on recent data, add to the vote) or a new hierarchy
+`CLMUnit`s** (train fresh on recent data, add to the vote) or a new hierarchy
 level. Additive, non-disruptive to existing columns.
 
 - Touch: `core/hierarchy.py` (append-unit / append-level APIs), `persist/store.py`.
@@ -154,5 +156,5 @@ make deploy        # or: make redeploy  (force retrain)
 ```
 
 Pickup prompt for next session:
-> "Continue CGLM improvements per NEXT_STEPS.md — implement #1, #6, and #8
+> "Continue CLM improvements per NEXT_STEPS.md — implement #1, #6, and #8
 > (parallel unit fan-out, scheduled incremental ingest, persisted replay buffer)."

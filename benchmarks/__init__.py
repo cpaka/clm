@@ -1,1 +1,1 @@
-"""benchmarks — accuracy, scaling and persistence benchmarks for CGLM."""
+"""benchmarks — accuracy, scaling and persistence benchmarks for CLM."""

@@ -1,5 +1,5 @@
 """
-tests/test_core.py — Unit tests for CGLM core modules.
+tests/test_core.py — Unit tests for CLM core modules.
 
 Run:  python -m pytest tests/ -v
 (or)  python -m tests.test_core      # runs without pytest
@@ -15,7 +15,7 @@ from core.encoder import TokenEncoder, SemanticEncoder
 from core.column import CorticalColumn
 from core.modulation import NeuromodSignal
 from core.replay import HippocampalBuffer
-from core.hierarchy import HierarchicalCGLM, SparseProjection
+from core.hierarchy import HierarchicalCLM, SparseProjection
 
 
 # ── SDR ───────────────────────────────────────────────────────────────────────
@@ -159,7 +159,7 @@ def test_projection_sparsity():
 
 def test_hierarchy_trains_and_predicts():
     seqs = [["the", "cat", "sat", "down"], ["the", "dog", "ran", "away"]] * 20
-    model = HierarchicalCGLM(n_levels=2, strides=(1, 4), n_units=2,
+    model = HierarchicalCLM(n_levels=2, strides=(1, 4), n_units=2,
                              col_dim=512, encoder="semantic", dim=512)
     model.train(seqs, epochs=8)
     preds = model.predict_next(["the", "cat"], topn=3)
@@ -168,7 +168,7 @@ def test_hierarchy_trains_and_predicts():
 
 
 def test_hierarchy_stats():
-    model = HierarchicalCGLM(n_levels=1, strides=(1,), n_units=1, col_dim=256)
+    model = HierarchicalCLM(n_levels=1, strides=(1,), n_units=1, col_dim=256)
     model.train([["a", "b", "c"]], epochs=1)
     s = model.stats()
     assert s["levels"] == 1 and s["units_per_level"] == 1

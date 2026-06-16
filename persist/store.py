@@ -1,9 +1,9 @@
 """
-persist/store.py — Fast filesystem persistence for HierarchicalCGLM.
+persist/store.py — Fast filesystem persistence for HierarchicalCLM.
 
 Format
 ------
-A directory named `<name>.cglm/` containing:
+A directory named `<name>.clm/` containing:
   config.json          — hyperparameters and metrics
   enc_<l>_<u>.npz     — SemanticEncoder fingerprints for level l, unit u
   col_<l>_<u>.npz     — CorticalColumn arrays for level l, unit u
@@ -25,25 +25,25 @@ from pathlib import Path
 
 import numpy as np
 
-from core.hierarchy import HierarchicalCGLM
+from core.hierarchy import HierarchicalCLM
 from core.encoder import SemanticEncoder
 
 
 def checkpoint_path(base: str, name: str = "model") -> str:
-    """Return <base>/<name>.cglm path (does not create it)."""
-    return str(Path(base) / f"{name}.cglm")
+    """Return <base>/<name>.clm path (does not create it)."""
+    return str(Path(base) / f"{name}.clm")
 
 
 # ── Save ─────────────────────────────────────────────────────────────────────
 
-def save_model(model: HierarchicalCGLM, path: str) -> None:
+def save_model(model: HierarchicalCLM, path: str) -> None:
     """
     Persist all model state to `path` (directory created if needed).
 
     Parameters
     ----------
-    model : trained HierarchicalCGLM
-    path  : directory path (e.g. "runs/experiment1.cglm")
+    model : trained HierarchicalCLM
+    path  : directory path (e.g. "runs/experiment1.clm")
     """
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
@@ -104,9 +104,9 @@ def save_model(model: HierarchicalCGLM, path: str) -> None:
 
 # ── Load ─────────────────────────────────────────────────────────────────────
 
-def load_model(path: str) -> HierarchicalCGLM:
+def load_model(path: str) -> HierarchicalCLM:
     """
-    Restore a HierarchicalCGLM from a saved directory.
+    Restore a HierarchicalCLM from a saved directory.
 
     The returned model is ready for inference and incremental training.
     """
@@ -117,7 +117,7 @@ def load_model(path: str) -> HierarchicalCGLM:
     col_kwargs["periods"] = tuple(col_kwargs["periods"])
 
     # encoder_cfg already carries dim/fp_bits/index_bits/window
-    model = HierarchicalCGLM(
+    model = HierarchicalCLM(
         n_levels=cfg["n_levels"],
         strides=tuple(cfg["strides"]),
         n_units=cfg["n_units"],

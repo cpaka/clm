@@ -1,5 +1,5 @@
 """
-CGLM Modal deployment — Hierarchical Cortical-Grid Language Model.
+CLM Modal deployment — Hierarchical Cortical Language Model.
 
 This deploys the modular brain-architecture model in ``core/``:
   • hierarchical cortical levels with temporal strides
@@ -8,7 +8,7 @@ This deploys the modular brain-architecture model in ``core/``:
   • hippocampal replay
   • sparse inter-area projections
   • vectorised (GPU-ready) columns
-Persistence uses the compressed .npz store in ``persist/`` (model.cglm dir on
+Persistence uses the compressed .npz store in ``persist/`` (model.clm dir on
 the Volume) — ~1000× smaller than raw pickle of the dense segment arrays.
 
 Dataset lifecycle (one-time, shared across all versions):
@@ -49,7 +49,7 @@ class GenerateReq(BaseModel):
 # Version — bump to create a new independent deployment + isolated volume dir
 # ---------------------------------------------------------------------------
 
-VERSION = "v2"
+VERSION = "v3"
 
 # ---------------------------------------------------------------------------
 # Per-version configs
@@ -97,16 +97,16 @@ MODEL_CONFIG = {
 # Modal plumbing
 # ---------------------------------------------------------------------------
 
-app = modal.App(f"cglm-chat-{VERSION}")
+app = modal.App(f"clm-chat-{VERSION}")
 vol = modal.Volume.from_name("cglm-data", create_if_missing=True)
 # Shared live-training status — the train container writes progress here and the
 # web container reads it (no Volume commit/reload churn for fast UI polling).
-status_dict = modal.Dict.from_name("cglm-train-status", create_if_missing=True)
+status_dict = modal.Dict.from_name("clm-train-status", create_if_missing=True)
 _VOL_MOUNT = "/data"                                 # volume mount point (constant)
 VOL_PATH = Path(_VOL_MOUNT) / VERSION                # versioned subdirectory
 REGISTRY_PATH = Path(_VOL_MOUNT) / "registry.json"   # shared across all versions
 DATASET_PATH = Path(_VOL_MOUNT) / "datasets" / "wikisimple-all.txt"  # shared raw dataset
-MODEL_DIR_NAME = "model.cglm"                         # persist/ store directory
+MODEL_DIR_NAME = "model.clm"                         # persist/ store directory
 
 
 def _set_status(**kw):
@@ -303,7 +303,7 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
     import sys
     import random
     sys.path.insert(0, "/root")
-    from core.hierarchy import HierarchicalCGLM
+    from core.hierarchy import HierarchicalCLM
     from benchmarks.datasets import _tokenize          # shared tokenizer
     from benchmarks.metrics import accuracy
     from persist.store import save_model
@@ -330,7 +330,7 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
            "strides": tuple(MODEL_CONFIG["strides"]),
            "periods": tuple(MODEL_CONFIG["periods"]),
            "encoder": "semantic"}
-    model = HierarchicalCGLM(**cfg)
+    model = HierarchicalCLM(**cfg)
 
     _set_status(phase="folding", message="Folding semantic fingerprints…")
 
@@ -449,7 +449,7 @@ CHAT_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CGLM Console</title>
+<title>CLM Console</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -509,7 +509,7 @@ CHAT_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>CGLM Console</h1>
+  <h1>CLM Console</h1>
   <span id="ver"></span>
   <nav>
     <button data-view="chat" class="active">Chat</button>
@@ -762,12 +762,18 @@ class WebApp:
         if metrics_path.exists():
             self.metrics = json.loads(metrics_path.read_text())
 
+    def _ensure_model(self):
+        """Lazily pick up a model trained after this (always-on) container
+        started — so a fresh `make deploy` needs no manual /reload."""
+        if self.model is None:
+            self._load_model(refresh=True)
+
     @modal.asgi_app()
     def serve(self):
         from fastapi import FastAPI
         from fastapi.responses import HTMLResponse, JSONResponse
 
-        api = FastAPI(title="CGLM Chat")
+        api = FastAPI(title="CLM Chat")
 
         @api.get("/", response_class=HTMLResponse)
         async def index():
@@ -775,6 +781,7 @@ class WebApp:
 
         @api.post("/predict")
         async def predict(body: PredictReq):
+            self._ensure_model()
             if not self.model:
                 return JSONResponse({"error": "Model not loaded"}, status_code=503)
             preds = self.model.predict_next(body.tokens, topn=body.topn)
@@ -782,12 +789,14 @@ class WebApp:
 
         @api.post("/generate")
         async def generate(body: GenerateReq):
+            self._ensure_model()
             if not self.model:
                 return JSONResponse({"error": "Model not loaded"}, status_code=503)
             return {"generated": self.model.generate(body.tokens, n=body.n)}
 
         @api.get("/similar")
         async def similar(word: str, k: int = 6):
+            self._ensure_model()
             if not self.model:
                 return JSONResponse({"error": "Model not loaded"}, status_code=503)
             return {"word": word,
@@ -795,12 +804,14 @@ class WebApp:
 
         @api.get("/fingerprint")
         async def fingerprint(word: str):
+            self._ensure_model()
             if not self.model:
                 return JSONResponse({"error": "Model not loaded"}, status_code=503)
             return self.model.fingerprint(word)
 
         @api.get("/stats")
         async def stats():
+            self._ensure_model()
             if not self.model:
                 return {"model_loaded": False, "version": VERSION,
                         "status": "no model — bootstrap in progress"}

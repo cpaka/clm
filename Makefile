@@ -25,4 +25,4 @@ redeploy:
 
 # Tail logs for the running web app.
 logs:
-	modal app logs cglm-chat-$(shell grep '^VERSION' modal_app.py | cut -d'"' -f2)
+	modal app logs clm-chat-$(shell grep '^VERSION' modal_app.py | cut -d'"' -f2)

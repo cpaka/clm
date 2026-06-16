@@ -1,4 +1,4 @@
-# CGLM — Hierarchical Cortical-Grid Language Model
+# CLM — Hierarchical Cortical Language Model
 
 A biologically-inspired language model built on **Sparse Distributed
 Representations (SDRs)** — no backprop, no float matmuls at inference — deployed
@@ -63,7 +63,7 @@ cglm_modal/
 │   ├── column.py       CorticalColumn — vectorised HTM temporal memory
 │   ├── modulation.py   NeuromodSignal — plasticity gating from prediction quality
 │   ├── replay.py       HippocampalBuffer — surprise-prioritised episodic replay
-│   └── hierarchy.py    HierarchicalCGLM — levels, projections, voting, inference
+│   └── hierarchy.py    HierarchicalCLM — levels, projections, voting, inference
 ├── persist/
 │   └── store.py        save_model / load_model — compressed .npz filesystem store
 ├── benchmarks/
@@ -73,7 +73,7 @@ cglm_modal/
 ├── tests/
 │   ├── test_core.py    unit tests for every module
 │   └── test_persist.py round-trip + warm-start tests
-├── modal_app.py        Modal deployment: dataset → corpus → train → serve → notebook
+├── modal_app.py        Modal deployment: dataset → corpus → train → serve (chat + dashboard + explore)
 ├── model_core.py       legacy flat model (kept as fallback; no longer wired)
 ├── Makefile
 └── requirements.txt
@@ -87,13 +87,13 @@ files than raw pickle:
 
 ```python
 from persist.store import save_model, load_model
-save_model(model, "model.cglm")     # directory of compressed .npz blobs
-model = load_model("model.cglm")     # ready for inference + warm-start
+save_model(model, "model.clm")     # directory of compressed .npz blobs
+model = load_model("model.clm")     # ready for inference + warm-start
 model.train(more_corpus, epochs=5)   # incremental learning continues
 ```
 
 On Modal, the checkpoint is written to the `cglm-data` Volume at
-`/data/<VERSION>/model.cglm` and loaded by the web container on cold start.
+`/data/<VERSION>/model.clm` and loaded by the web container on cold start.
 
 ## Quickstart (Modal)
 
@@ -118,21 +118,25 @@ make redeploy             # force retrain even if a checkpoint exists
 make logs                 # tail the running web app
 ```
 
-`bootstrap` samples a corpus slice, trains `HierarchicalCGLM`, writes
-`model.cglm`, `metrics.json`, and `analytics.ipynb` to the Volume, and records a
-registry entry. Bump `VERSION` in `modal_app.py` for an isolated new deployment.
+`bootstrap` samples a corpus slice, trains `HierarchicalCLM`, writes
+`model.clm` and `metrics.json` to the Volume, and records a registry entry.
+Bump `VERSION` in `modal_app.py` for an isolated new deployment.
 
 ## REST API (served by `WebApp.serve`)
 
 | Method | Path | Body | Response |
 |---|---|---|---|
-| `GET`  | `/` | — | Chat HTML UI |
+| `GET`  | `/` | — | Console UI (Chat / Dashboard / Explore) |
 | `POST` | `/predict` | `{"tokens":["the","cat"],"topn":5}` | `{"predictions":[["sat",0.8],...]}` |
 | `POST` | `/generate` | `{"tokens":["the","cat"],"n":10}` | `{"generated":[...]}` |
 | `GET`  | `/similar?word=cat&k=6` | — | nearest words by fingerprint overlap |
+| `GET`  | `/fingerprint?word=cat` | — | active SDR bits + dim (for the Explore viz) |
 | `GET`  | `/stats` | — | model stats (levels, vocab, segments, neuromod…) |
 | `GET`  | `/metrics` | — | per-epoch training metrics |
 | `GET`  | `/registry` | — | all deployed versions |
+| `POST` | `/train` | — | spawn a live training run (non-blocking) |
+| `GET`  | `/status` | — | live training phase / progress / metrics |
+| `POST` | `/reload` | — | reload the freshly-trained model into the web container |
 | `GET`  | `/health` | — | `{"ok": true}` |
 
 ## Run locally (no Modal)
@@ -153,8 +157,8 @@ python -m tests.test_persist
 Python API:
 
 ```python
-from core.hierarchy import HierarchicalCGLM
-model = HierarchicalCGLM(n_levels=2, strides=(1,4), n_units=4,
+from core.hierarchy import HierarchicalCLM
+model = HierarchicalCLM(n_levels=2, strides=(1,4), n_units=4,
                          col_dim=2048, encoder="semantic",
                          kwta_k=42, replay_cap=512)
 model.train(corpus_sequences, epochs=10)
@@ -196,7 +200,7 @@ time, model size, and segment count across three bundled corpora:
 
 ## How it compares to LLMs
 
-| | CGLM | Transformer LLM |
+| | CLM | Transformer LLM |
 |---|---|---|
 | Learning | Online Hebbian + neuromodulation + replay | Offline gradient descent |
 | Compute | Binary SDR algebra; CPU or GPU | GPU, hours–days |
@@ -204,7 +208,7 @@ time, model size, and segment count across three bundled corpora:
 | Interpretability | High (traceable predictions) | Low |
 | Accuracy on general text | Low–moderate | State of the art |
 
-CGLM is not competing on perplexity — it explores whether sparse,
+CLM is not competing on perplexity — it explores whether sparse,
 biologically-inspired memory can produce useful predictions with a fraction of
 the compute, and whether brain-architecture mechanisms (hierarchy, inhibition,
 neuromodulation, replay) improve a backprop-free learner.

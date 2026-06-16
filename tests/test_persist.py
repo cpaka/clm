@@ -6,19 +6,19 @@ import tempfile
 
 import numpy as np
 
-from core.hierarchy import HierarchicalCGLM
+from core.hierarchy import HierarchicalCLM
 from persist.store import save_model, load_model
 
 
 def test_save_load_roundtrip():
     seqs = [["the", "cat", "sat"], ["the", "dog", "ran"]] * 15
-    model = HierarchicalCGLM(n_levels=2, strides=(1, 4), n_units=2,
+    model = HierarchicalCLM(n_levels=2, strides=(1, 4), n_units=2,
                              col_dim=512, encoder="semantic", dim=512)
     model.train(seqs, epochs=5)
     before = model.predict_next(["the", "cat"], topn=3)
 
     with tempfile.TemporaryDirectory() as d:
-        path = f"{d}/model.cglm"
+        path = f"{d}/model.clm"
         save_model(model, path)
         restored = load_model(path)
 
@@ -30,13 +30,13 @@ def test_save_load_roundtrip():
 def test_warm_start_training():
     """Loaded model can continue training (incremental learning)."""
     seqs = [["a", "b", "c"], ["a", "b", "d"]] * 10
-    model = HierarchicalCGLM(n_levels=1, strides=(1,), n_units=1, col_dim=256,
+    model = HierarchicalCLM(n_levels=1, strides=(1,), n_units=1, col_dim=256,
                              encoder="random")
     model.train(seqs, epochs=3)
     segs_before = model.stats()["segments_l0"]
 
     with tempfile.TemporaryDirectory() as d:
-        path = f"{d}/m.cglm"
+        path = f"{d}/m.clm"
         save_model(model, path)
         restored = load_model(path)
         restored.train([["a", "b", "e"]] * 5, epochs=3)

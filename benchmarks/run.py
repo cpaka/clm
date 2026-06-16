@@ -13,14 +13,14 @@ from __future__ import annotations
 import argparse
 import time
 
-from core.hierarchy import HierarchicalCGLM
+from core.hierarchy import HierarchicalCLM
 from benchmarks.datasets import REGISTRY
 from benchmarks.metrics import evaluate, perplexity_proxy
 
 
 def build(n_units=3, n_levels=2, strides=(1, 4), encoder="semantic",
-          col_dim=2048, **kw) -> HierarchicalCGLM:
-    return HierarchicalCGLM(
+          col_dim=2048, **kw) -> HierarchicalCLM:
+    return HierarchicalCLM(
         n_levels=n_levels, strides=strides, n_units=n_units,
         col_dim=col_dim, encoder=encoder, **kw
     )
@@ -73,7 +73,7 @@ def _print_row(r):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="CGLM benchmark harness")
+    ap = argparse.ArgumentParser(description="CLM benchmark harness")
     ap.add_argument("--dataset", default="all", choices=["all", *REGISTRY])
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--units", type=int, default=3)
@@ -82,7 +82,7 @@ def main():
                     help="run a units-vs-accuracy scaling study on 'motifs'")
     args = ap.parse_args()
 
-    print(f"\nCGLM benchmark — encoder={args.encoder} epochs={args.epochs}\n")
+    print(f"\nCLM benchmark — encoder={args.encoder} epochs={args.epochs}\n")
     _print_header()
 
     if args.scaling:

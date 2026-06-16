@@ -15,6 +15,12 @@ from pathlib import Path
 import modal
 
 # ---------------------------------------------------------------------------
+# Version — bump this to create a new independent Modal deployment + volume dir
+# ---------------------------------------------------------------------------
+
+VERSION = "v1"
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
@@ -36,9 +42,10 @@ BEST_CONFIG = {
 # Modal plumbing
 # ---------------------------------------------------------------------------
 
-app = modal.App("cglm-chat")
+app = modal.App(f"cglm-chat-{VERSION}")
 vol = modal.Volume.from_name("cglm-data", create_if_missing=True)
-VOL_PATH = Path("/data")
+_VOL_MOUNT = "/data"                      # where the volume is mounted
+VOL_PATH = Path(_VOL_MOUNT) / VERSION     # versioned subdirectory
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -56,11 +63,12 @@ nb_image = (
 # Corpus: Simple English Wikipedia via public API
 # ---------------------------------------------------------------------------
 
-@app.function(image=image, volumes={str(VOL_PATH): vol}, timeout=300)
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=300)
 def fetch_corpus(n_articles: int = 2000, max_chars: int = 400_000) -> str:
     import re
     import requests
 
+    VOL_PATH.mkdir(parents=True, exist_ok=True)
     out_path = VOL_PATH / "corpus.txt"
     api = "https://simple.wikipedia.org/w/api.php"
     all_text: list[str] = []
@@ -122,7 +130,7 @@ def fetch_corpus(n_articles: int = 2000, max_chars: int = 400_000) -> str:
 
 @app.function(
     image=image,
-    volumes={str(VOL_PATH): vol},
+    volumes={_VOL_MOUNT: vol},
     timeout=1800,
     cpu=4,
 )
@@ -132,6 +140,7 @@ def train(test_fraction: float = 0.15) -> dict:
     sys.path.insert(0, "/root")
     from model_core import SemanticCorticalGridLM, tokenize, accuracy
 
+    VOL_PATH.mkdir(parents=True, exist_ok=True)
     corpus_path = VOL_PATH / "corpus.txt"
     if not corpus_path.exists():
         return {"error": "corpus.txt not found — run fetch_corpus first"}
@@ -421,7 +430,7 @@ setInterval(loadStatus, 30000);
 
 @app.cls(
     image=image,
-    volumes={str(VOL_PATH): vol},
+    volumes={_VOL_MOUNT: vol},
     min_containers=1,
 )
 class WebApp:
@@ -476,9 +485,10 @@ class WebApp:
         @api.get("/stats")
         async def stats():
             if not self.model:
-                return {"model_loaded": False, "status": "no model — run train first"}
+                return {"model_loaded": False, "version": VERSION, "status": "no model — run train first"}
             s = self.model.stats()
             s["model_loaded"] = True
+            s["version"] = VERSION
             return s
 
         @api.get("/metrics")
@@ -498,7 +508,7 @@ class WebApp:
 
 @app.function(
     image=nb_image,
-    volumes={str(VOL_PATH): vol},
+    volumes={_VOL_MOUNT: vol},
     timeout=3600,
 )
 @modal.web_server(8888)

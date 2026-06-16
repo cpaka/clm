@@ -1,12 +1,24 @@
-.PHONY: deploy redeploy logs
+.PHONY: deploy redeploy upload-dataset logs
 
-# Full deploy: push code to Modal, then run corpus fetch + training in one go.
-# Idempotent: bootstrap skips if this version's model.pkl already exists.
+# Upload the raw Wikipedia dataset to the Modal Volume (one-time, shared across all versions).
+# Safe to re-run: skips download if the file already exists.
+# Requires Kaggle credentials in the 'kaggle-credentials' Modal secret.
+# Before first run: accept the dataset license at
+#   https://www.kaggle.com/datasets/ffatty/plain-text-wikipedia-simpleenglish
+upload-dataset:
+	modal run modal_app.py::upload_dataset
+
+# Force re-download even if dataset file already exists.
+upload-dataset-force:
+	modal run modal_app.py::upload_dataset --force
+
+# Full deploy: push code to Modal, then auto-train (idempotent per VERSION).
+# If the raw dataset is already in the volume, bootstrap skips the download step.
 deploy:
 	modal deploy modal_app.py
 	modal run modal_app.py::bootstrap
 
-# Force retrain even if model already exists for this version.
+# Force retrain even if model.pkl already exists for this VERSION.
 redeploy:
 	modal deploy modal_app.py
 	modal run modal_app.py::bootstrap --force

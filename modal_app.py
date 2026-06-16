@@ -1,14 +1,17 @@
 """
 CGLM Modal deployment.
 
-Workflow per version:
-  make deploy          → modal deploy + modal run ::bootstrap
-  bootstrap            → fetch_corpus.local() + train.local() + registry append
+Dataset lifecycle (one-time, shared across all versions):
+  make upload-dataset  → downloads AllCombined.txt from Kaggle → /data/datasets/
+
+Per-version workflow:
+  make deploy          → modal deploy + bootstrap (fetch_corpus + train + registry)
+  make redeploy        → same but forces retrain even if model exists
 
 Versioning:
-  Bump VERSION to get an independent app name, volume subdir, and registry entry.
-  CORPUS_CONFIG and TRAIN_CONFIG are per-version — start small, increase once
-  inference quality is confirmed.
+  Bump VERSION to create a new independent deployment + volume subdir + registry entry.
+  fetch_corpus samples a random slice from the shared dataset for each version.
+  CORPUS_CONFIG and TRAIN_CONFIG are per-version.
 """
 from __future__ import annotations
 import datetime
@@ -34,7 +37,7 @@ VERSION = "v1"
 # ---------------------------------------------------------------------------
 
 CORPUS_CONFIG = {
-    "name": "wikisimple (mikeortman/wikisimple)",
+    "name": "plain-text-wikipedia-simpleenglish (ffatty/plain-text-wikipedia-simpleenglish)",
     "max_chars": 60_000,  # → 400_000 once inference confirmed
 }
 
@@ -62,9 +65,10 @@ MODEL_CONFIG = {
 
 app = modal.App(f"cglm-chat-{VERSION}")
 vol = modal.Volume.from_name("cglm-data", create_if_missing=True)
-_VOL_MOUNT = "/data"                    # volume mount point (constant)
-VOL_PATH = Path(_VOL_MOUNT) / VERSION  # versioned subdirectory
+_VOL_MOUNT = "/data"                              # volume mount point (constant)
+VOL_PATH = Path(_VOL_MOUNT) / VERSION            # versioned subdirectory
 REGISTRY_PATH = Path(_VOL_MOUNT) / "registry.json"  # shared across all versions
+DATASET_PATH = Path(_VOL_MOUNT) / "datasets" / "wikisimple-all.txt"  # shared raw dataset
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -105,100 +109,148 @@ def _upsert_registry(entry: dict):
 
 
 # ---------------------------------------------------------------------------
-# Corpus: Simple English Wikipedia via Kaggle REST API v1
-# Dataset: mikeortman/wikisimple — plain-text Simple English Wikipedia articles
-# Using REST v1 directly: the kaggle 2.x CLI switched to gRPC which rejects
-# old-format credentials; v1 REST works with both KGAT Bearer and Basic auth.
+# Dataset — downloaded ONCE, shared across all model versions
+#
+# Source : https://www.kaggle.com/datasets/ffatty/plain-text-wikipedia-simpleenglish
+# File   : AllCombined.txt  (249,396 articles, ~178 MB plain text)
+# Storage: /data/datasets/wikisimple-all.txt  (lives outside any version dir)
+#
+# Run once:  make upload-dataset
+# Bootstrap skips this step automatically if the file already exists.
 # ---------------------------------------------------------------------------
 
-KAGGLE_DATASET = "mikeortman/wikisimple"
+KAGGLE_DATASET = "ffatty/plain-text-wikipedia-simpleenglish"
+KAGGLE_FILE = "AllCombined.txt"
 
-@app.function(image=image, secrets=[kaggle_secret], volumes={_VOL_MOUNT: vol}, timeout=300)
-def fetch_corpus(max_chars: int = CORPUS_CONFIG["max_chars"]) -> dict:
+
+def _kaggle_auth_header(os_env) -> dict:
+    """Return Authorization header from available Kaggle env vars."""
     import base64
-    import csv
+    api_token = os_env.get("KAGGLE_API_TOKEN") or os_env.get("KAGGLE_KEY") or ""
+    username = os_env.get("KAGGLE_USERNAME", "")
+    if api_token.startswith("KGAT"):
+        return {"Authorization": f"Bearer {api_token}"}
+    if username and api_token:
+        creds = base64.b64encode(f"{username}:{api_token}".encode()).decode()
+        return {"Authorization": f"Basic {creds}"}
+    if api_token:
+        return {"Authorization": f"Bearer {api_token}"}
+    raise RuntimeError(
+        f"No Kaggle credentials in environment. "
+        f"Vars seen: {[k for k in os_env if 'KAGGLE' in k.upper()]}"
+    )
+
+
+@app.function(image=image, secrets=[kaggle_secret], volumes={_VOL_MOUNT: vol}, timeout=600)
+def upload_dataset(force: bool = False) -> dict:
+    """
+    Download AllCombined.txt from Kaggle once and store in the shared dataset dir.
+    Subsequent model versions reuse this file — no re-download needed.
+    """
     import io
     import os
-    import re
     import requests
     import zipfile
 
-    VOL_PATH.mkdir(parents=True, exist_ok=True)
-    out_path = VOL_PATH / "corpus.txt"
+    DATASET_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    # Build auth header: KGAT Bearer or Basic username:key
-    kaggle_keys = {k: v for k, v in os.environ.items() if "KAGGLE" in k.upper()}
-    print(f"Kaggle env vars present: {list(kaggle_keys.keys())}")
+    if DATASET_PATH.exists() and not force:
+        size_mb = DATASET_PATH.stat().st_size / 1_048_576
+        print(f"Dataset already present: {DATASET_PATH} ({size_mb:.1f} MB) — skipping.")
+        return {"status": "already_exists", "path": str(DATASET_PATH), "size_mb": round(size_mb, 1)}
 
-    # Support all known env var names Kaggle CLI and SDK accept
-    api_token = (
-        os.environ.get("KAGGLE_API_TOKEN")
-        or os.environ.get("KAGGLE_KEY")
-        or ""
-    )
-    username = os.environ.get("KAGGLE_USERNAME", "")
-
-    if api_token.startswith("KGAT"):
-        auth_header = {"Authorization": f"Bearer {api_token}"}
-    elif username and api_token:
-        creds = base64.b64encode(f"{username}:{api_token}".encode()).decode()
-        auth_header = {"Authorization": f"Basic {creds}"}
-    elif api_token:
-        # Token present but no username — try Bearer anyway (some newer keys work)
-        auth_header = {"Authorization": f"Bearer {api_token}"}
-    else:
-        raise RuntimeError(f"No Kaggle credentials found. Env vars seen: {list(kaggle_keys.keys())}")
-
-    # Download dataset zip via REST API v1
+    auth = _kaggle_auth_header(dict(os.environ))
     url = f"https://www.kaggle.com/api/v1/datasets/download/{KAGGLE_DATASET}"
     print(f"Downloading {url} ...")
-    resp = requests.get(url, headers=auth_header, stream=True, allow_redirects=True, timeout=120)
+
+    # Stream into memory (zip is ~50-80 MB compressed; text ~178 MB uncompressed)
+    resp = requests.get(url, headers=auth, stream=True, allow_redirects=True, timeout=300)
     if resp.status_code == 403:
         raise RuntimeError(
-            f"403 Forbidden downloading {KAGGLE_DATASET}. "
-            "The dataset likely requires license acceptance. "
-            f"Visit https://www.kaggle.com/datasets/{KAGGLE_DATASET} "
-            "and click Download to accept the license, then redeploy. "
-            f"Response: {resp.text[:300]}"
+            f"403 Forbidden. Accept the dataset license at "
+            f"https://www.kaggle.com/datasets/{KAGGLE_DATASET} then retry."
         )
     resp.raise_for_status()
 
-    zip_bytes = io.BytesIO(resp.content)
+    downloaded_bytes = 0
+    chunks = []
+    for chunk in resp.iter_content(chunk_size=1 << 20):  # 1 MB chunks
+        chunks.append(chunk)
+        downloaded_bytes += len(chunk)
+        if downloaded_bytes % (10 << 20) < (1 << 20):
+            print(f"  {downloaded_bytes // (1 << 20)} MB downloaded...")
+    print(f"Download complete: {downloaded_bytes // (1 << 20)} MB")
+
+    zip_bytes = io.BytesIO(b"".join(chunks))
+    with zipfile.ZipFile(zip_bytes) as zf:
+        names = zf.namelist()
+        print(f"Zip contents: {names}")
+        # Find AllCombined.txt (may be nested in a subdirectory)
+        target = next((n for n in names if n.endswith(KAGGLE_FILE)), None)
+        if target is None:
+            raise RuntimeError(f"{KAGGLE_FILE} not found in zip. Contents: {names}")
+        print(f"Extracting {target} → {DATASET_PATH} ...")
+        data = zf.read(target)
+        DATASET_PATH.write_bytes(data)
+
+    size_mb = DATASET_PATH.stat().st_size / 1_048_576
+    vol.commit()
+    print(f"Dataset saved: {DATASET_PATH} ({size_mb:.1f} MB)")
+    return {"status": "downloaded", "path": str(DATASET_PATH), "size_mb": round(size_mb, 1)}
+
+
+# ---------------------------------------------------------------------------
+# Corpus sampling — reads from shared dataset, no credentials required.
+# Each version can sample a different slice (via random seed = VERSION).
+# ---------------------------------------------------------------------------
+
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=120)
+def fetch_corpus(max_chars: int = CORPUS_CONFIG["max_chars"]) -> dict:
+    """
+    Sample a random slice from the shared raw dataset and write to the
+    versioned corpus path. No Kaggle credentials needed after upload_dataset.
+    """
+    import random
+    import re
+
+    if not DATASET_PATH.exists():
+        raise RuntimeError(
+            f"Raw dataset not found at {DATASET_PATH}. "
+            "Run 'make upload-dataset' first."
+        )
+
+    file_size = DATASET_PATH.stat().st_size
+    # Pick a random start point so different versions get different slices
+    rng = random.Random(VERSION)
+    read_window = min(max_chars * 6, file_size)  # read 6× to have enough after filtering
+    max_start = max(0, file_size - read_window)
+    start = rng.randint(0, max_start)
+
+    with open(DATASET_PATH, "rb") as fh:
+        fh.seek(start)
+        raw = fh.read(read_window).decode("utf-8", errors="ignore")
+
+    # The file has articles separated by double newlines; split on those
+    articles = [a.strip() for a in raw.split("\n\n") if len(a.strip()) > 80]
+
+    # Shuffle with a deterministic seed (VERSION-based) for reproducibility
+    rng.shuffle(articles)
+
     all_text: list[str] = []
     total_chars = 0
+    for article in articles:
+        if total_chars >= max_chars:
+            break
+        all_text.append(article)
+        total_chars += len(article)
 
-    with zipfile.ZipFile(zip_bytes) as zf:
-        for name in zf.namelist():
-            if total_chars >= max_chars:
-                break
-            if name.endswith(".txt"):
-                raw = zf.read(name).decode("utf-8", errors="ignore")
-                raw = re.sub(r"={2,}[^=]*={2,}", " ", raw)
-                raw = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]*)\]\]", r"\1", raw)
-                raw = re.sub(r"\{\{[^}]*\}\}", " ", raw)
-                raw = re.sub(r"<[^>]+>", " ", raw)
-                raw = re.sub(r"\s+", " ", raw).strip()
-                if len(raw) > 80:
-                    all_text.append(raw)
-                    total_chars += len(raw)
-            elif name.endswith(".csv"):
-                content = zf.read(name).decode("utf-8", errors="ignore")
-                reader = csv.DictReader(io.StringIO(content))
-                for row in reader:
-                    if total_chars >= max_chars:
-                        break
-                    text = row.get("text") or row.get("Text") or row.get("content") or ""
-                    text = text.strip()
-                    if len(text) > 80:
-                        all_text.append(text)
-                        total_chars += len(text)
-
-    corpus = " ".join(all_text)[:max_chars]
-    out_path.write_text(corpus, encoding="utf-8")
+    VOL_PATH.mkdir(parents=True, exist_ok=True)
+    corpus = "\n\n".join(all_text)[:max_chars]
+    (VOL_PATH / "corpus.txt").write_text(corpus, encoding="utf-8")
     vol.commit()
-    chars = len(corpus)
-    print(f"Corpus: {len(all_text)} segments, {chars:,} chars → {out_path}")
-    return {"articles": len(all_text), "chars": chars}
+
+    print(f"Corpus: {len(all_text)} articles, {len(corpus):,} chars → {VOL_PATH}/corpus.txt")
+    return {"articles": len(all_text), "chars": len(corpus)}
 
 
 # ---------------------------------------------------------------------------
@@ -383,18 +435,26 @@ def _write_notebook(epoch_metrics: list[dict]):
 
 @app.function(image=image, secrets=[kaggle_secret], volumes={_VOL_MOUNT: vol}, timeout=660)
 def bootstrap(force: bool = False):
-    """Idempotent post-deploy pipeline: corpus → train → registry entry."""
+    """Idempotent post-deploy pipeline: dataset check → corpus sample → train → registry."""
     VOL_PATH.mkdir(parents=True, exist_ok=True)
 
     model_path = VOL_PATH / "model.pkl"
     if model_path.exists() and not force:
-        print(f"[{VERSION}] Model already exists — skipping bootstrap. Pass force=True to retrain.")
+        print(f"[{VERSION}] Model already exists — skipping. Use 'make redeploy' to force retrain.")
         return
 
-    print(f"[{VERSION}] Step 1/2: fetching corpus...")
+    # Step 0: ensure the shared raw dataset is present (download only if missing)
+    if not DATASET_PATH.exists():
+        print(f"[{VERSION}] Step 0/3: raw dataset not found — uploading from Kaggle...")
+        upload_dataset.local()
+    else:
+        size_mb = DATASET_PATH.stat().st_size / 1_048_576
+        print(f"[{VERSION}] Step 0/3: raw dataset already present ({size_mb:.1f} MB) ✓")
+
+    print(f"[{VERSION}] Step 1/3: sampling corpus from dataset...")
     corpus_info = fetch_corpus.local(max_chars=CORPUS_CONFIG["max_chars"])
 
-    print(f"[{VERSION}] Step 2/2: training...")
+    print(f"[{VERSION}] Step 2/3: training...")
     result = train.local(test_fraction=TRAIN_CONFIG["test_fraction"])
 
     if "error" in result:

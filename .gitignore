@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 *.pkl
+.DS_Store
 *.ipynb_checkpoints/
 .env
 .modal/

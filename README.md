@@ -1,146 +1,213 @@
-# CGLM — Cortical-Grid Language Model
+# CGLM — Hierarchical Cortical-Grid Language Model
 
-A biologically-inspired language model built on Hierarchical Temporal Memory (HTM) principles, deployed serverlessly on [Modal.com](https://modal.com).
+A biologically-inspired language model built on **Sparse Distributed
+Representations (SDRs)** — no backprop, no float matmuls at inference — deployed
+serverlessly on [Modal.com](https://modal.com).
 
-## What it is
+This version is a ground-up modular refactor that adds six brain-architecture
+mechanisms on top of the original flat model:
 
-CGLM uses **Sparse Distributed Representations (SDRs)** and a grid-cell location signal to learn temporal sequences from text, rather than gradient descent. Each token is encoded as a sparse binary vector; the model learns via Hebbian synapse growth and decay. It is designed to be:
-
-- **Fast at inference** — frozenset-based connected-synapse cache, O(columns) lookup
-- **Computationally lightweight** — no GPU required, runs on Modal CPU containers
-- **Interpretable** — synapse permanences are explicit, predictions are traceable
-
-### Architecture
-
-```
-Input text
-   │
-   ▼
-SemanticEncoder (IDF-weighted co-occurrence → sparse fingerprint, dim=2048, 21 active bits)
-   │
-   ▼
-GridLocation (multi-period phase code: periods 7,11,13,17,19,23 → 90-bit location SDR)
-   │
-   ▼
-Column (numpy-backed temporal memory — Segment arrays, vectorised overlap)
-   │  × 3 parallel units (ThreadPoolExecutor)
-   ▼
-Voting ensemble → next-token predictions
-```
-
-**Key optimisation:** Synapse segments use `numpy.int32` source arrays + `numpy.float32` permanence arrays. Overlap computation uses a reusable boolean active-buffer sliced via fancy indexing, avoiding per-step Python allocation.
-
-## Quickstart
-
-### Prerequisites
-
-- [Modal account](https://modal.com) + `modal` CLI installed
-- Python 3.11+
-
-```bash
-pip install modal
-modal setup   # authenticate
-```
-
-### Deploy
-
-```bash
-cd cglm_modal
-modal deploy modal_app.py
-```
-
-This deploys:
-| Endpoint | Description |
-|---|---|
-| `WebApp.serve` | Chat UI + REST API |
-| `notebook` | JupyterLab analytics (port 8888) |
-
-### Train a model
-
-```bash
-# 1. Download Wikipedia corpus (~400k chars from Simple English Wikipedia)
-modal run modal_app.py::fetch_corpus
-
-# 2. Train (5 epochs, per-epoch metrics saved to volume)
-modal run modal_app.py::train
-```
-
-Training saves `model.pkl`, `metrics.json`, and `analytics.ipynb` to the `cglm-data` Modal Volume.
-
-### Use the chat UI
-
-After deploying, open the `WebApp.serve` URL from `modal deploy` output. You'll see:
-
-- **Predict** — enter a phrase, get the top-5 predicted next tokens
-- **Generate** — auto-complete a phrase for 15 tokens
-- Live metrics: vocab size, segments/unit, test top-1 accuracy
-
-## REST API
-
-All endpoints are served by `WebApp.serve`:
-
-| Method | Path | Body | Response |
-|---|---|---|---|
-| `GET` | `/` | — | Chat HTML UI |
-| `POST` | `/predict` | `{"tokens": ["the", "cat"], "topn": 5}` | `{"predictions": [["sat", 0.8], ...]}` |
-| `POST` | `/generate` | `{"tokens": ["the", "cat"], "n": 10}` | `{"generated": ["the", "cat", "sat", ...]}` |
-| `GET` | `/stats` | — | Model stats (vocab, segments, etc.) |
-| `GET` | `/metrics` | — | Per-epoch training metrics JSON |
-| `GET` | `/health` | — | `{"ok": true}` |
-
-## Analytics
-
-The JupyterLab notebook (`notebook` function) serves a pre-generated `analytics.ipynb` with:
-
-- Training accuracy curves (test top-1, test top-3, train top-1 per epoch)
-- Model growth (synapses and segments per unit per epoch)
-- Completion demos with sample prompts
-- Vocabulary browser
-
-Run it:
-```bash
-modal run modal_app.py::notebook
-```
-
-## Configuration
-
-Hyperparameters are fixed in `BEST_CONFIG` in `modal_app.py`:
-
-| Parameter | Value | Notes |
+| Mechanism | Brain analogue | Module |
 |---|---|---|
-| `n_columns` | 3 | Parallel ensemble units |
-| `dim` | 2048 | SDR dimension |
-| `fp_bits` | 21 | Active bits per token fingerprint |
-| `index_bits` | 7 | Identity bits within fingerprint |
-| `window` | 2 | Co-occurrence context window |
-| `cells_per_col` | 8 | HTM cells per mini-column |
-| `periods` | (7,11,13,17,19,23) | Grid-cell phase periods |
-| `activation_threshold` | 10 | Min connected synapses to predict |
-| `new_synapses` | 24 | Synapses grown per learning step |
-| `epochs` | 5 | Training passes over corpus |
-| `max_sequences` | 3000 | Corpus sentence cap |
+| **Hierarchical levels** with temporal strides | cortical hierarchy / temporal abstraction | `core/hierarchy.py` |
+| **k-WTA lateral inhibition** | inhibitory interneurons enforcing sparsity | `core/sdr.py::kwta` |
+| **Neuromodulatory plasticity** | dopamine / norepinephrine gating of learning | `core/modulation.py` |
+| **Hippocampal replay** | sharp-wave-ripple consolidation during sleep | `core/replay.py` |
+| **Sparse inter-area projections** | thalamo-cortical axonal wiring | `core/hierarchy.py::SparseProjection` |
+| **Vectorised columns** | dense binary algebra, GPU-parallelisable | `core/column.py` |
 
-## Project structure
+## Why it stays fast (and is GPU-ready)
+
+Every signal is a binary SDR (~2 % active bits). The hot path — segment overlap
+— is a single numpy gather + reduce over fixed-shape arrays:
+
+```python
+syn_active = src[self.seg_idx]                          # fancy-index gather
+conn_ov    = (syn_active & connected & valid).sum(-1)   # reduce
+```
+
+Because all column state lives in regular `(n_cells, max_segs, syn_per_seg)`
+arrays, swapping `import numpy as np` for `import cupy as np` in `core/` runs the
+same code on a GPU with no algorithmic change.
+
+## Architecture
+
+```
+                       tokens
+                         │
+              ┌──────────▼───────────┐   stride 1   ← token granularity
+   Level 0   │  N voting columns     │   (semantic encoder)
+              └──────────┬───────────┘
+                         │  winners → SparseProjection
+              ┌──────────▼───────────┐   stride 4   ← phrase granularity
+   Level 1   │  N voting columns     │
+              └──────────────────────┘
+
+  prediction = vote(level-0 units) → k-WTA → decode by SDR overlap
+  plasticity = base × neuromod(recent burst rate)
+  consolidation = replay surprising episodes from hippocampal buffer
+```
+
+It **improves along two axes** with no code change: more **columns** (`n_units`)
+sharpen the vote; more **data** (online Hebbian learning + warm-start from a
+checkpoint) grows the synaptic memory.
+
+### Module map
 
 ```
 cglm_modal/
-├── model_core.py    # CGLM implementation (numpy-optimised)
-├── modal_app.py     # Modal functions: fetch_corpus, train, WebApp, notebook
-├── requirements.txt
-└── README.md
+├── core/
+│   ├── sdr.py          SDR primitives: convert, overlap, batch_overlap, make_sdr, kwta
+│   ├── grid.py         GridLocation — multi-scale path-integration location code
+│   ├── encoder.py      TokenEncoder (random) + SemanticEncoder (distributional)
+│   ├── column.py       CorticalColumn — vectorised HTM temporal memory
+│   ├── modulation.py   NeuromodSignal — plasticity gating from prediction quality
+│   ├── replay.py       HippocampalBuffer — surprise-prioritised episodic replay
+│   └── hierarchy.py    HierarchicalCGLM — levels, projections, voting, inference
+├── persist/
+│   └── store.py        save_model / load_model — compressed .npz filesystem store
+├── benchmarks/
+│   ├── datasets.py     reproducible corpora (grammar / motifs / natural)
+│   ├── metrics.py      top-1, top-3, MRR, perplexity proxy, accuracy
+│   └── run.py          benchmark harness + scaling study
+├── tests/
+│   ├── test_core.py    unit tests for every module
+│   └── test_persist.py round-trip + warm-start tests
+├── modal_app.py        Modal deployment: dataset → corpus → train → serve → notebook
+├── model_core.py       legacy flat model (kept as fallback; no longer wired)
+├── Makefile
+└── requirements.txt
 ```
+
+## Persistence (fast filesystem store)
+
+The dense segment arrays are large in memory but ~99.9 % empty, so the model is
+saved with **compressed `.npz`** (`persist/store.py`), giving ~1000× smaller
+files than raw pickle:
+
+```python
+from persist.store import save_model, load_model
+save_model(model, "model.cglm")     # directory of compressed .npz blobs
+model = load_model("model.cglm")     # ready for inference + warm-start
+model.train(more_corpus, epochs=5)   # incremental learning continues
+```
+
+On Modal, the checkpoint is written to the `cglm-data` Volume at
+`/data/<VERSION>/model.cglm` and loaded by the web container on cold start.
+
+## Quickstart (Modal)
+
+### Prerequisites
+- [Modal account](https://modal.com) + `modal` CLI, Python 3.11+
+- Kaggle credentials in a Modal secret named `kaggle-credentials` (for the dataset)
+
+```bash
+pip install modal
+modal setup
+```
+
+### One-time dataset upload
+```bash
+make upload-dataset       # AllCombined.txt (Simple English Wikipedia) → Volume
+```
+
+### Deploy + train (idempotent per VERSION)
+```bash
+make deploy               # modal deploy + bootstrap (fetch_corpus → train → registry)
+make redeploy             # force retrain even if a checkpoint exists
+make logs                 # tail the running web app
+```
+
+`bootstrap` samples a corpus slice, trains `HierarchicalCGLM`, writes
+`model.cglm`, `metrics.json`, and `analytics.ipynb` to the Volume, and records a
+registry entry. Bump `VERSION` in `modal_app.py` for an isolated new deployment.
+
+## REST API (served by `WebApp.serve`)
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| `GET`  | `/` | — | Chat HTML UI |
+| `POST` | `/predict` | `{"tokens":["the","cat"],"topn":5}` | `{"predictions":[["sat",0.8],...]}` |
+| `POST` | `/generate` | `{"tokens":["the","cat"],"n":10}` | `{"generated":[...]}` |
+| `GET`  | `/similar?word=cat&k=6` | — | nearest words by fingerprint overlap |
+| `GET`  | `/stats` | — | model stats (levels, vocab, segments, neuromod…) |
+| `GET`  | `/metrics` | — | per-epoch training metrics |
+| `GET`  | `/registry` | — | all deployed versions |
+| `GET`  | `/health` | — | `{"ok": true}` |
+
+## Run locally (no Modal)
+
+```bash
+pip install numpy
+
+# benchmarks
+python -m benchmarks.run                    # all datasets
+python -m benchmarks.run --dataset motifs --epochs 15
+python -m benchmarks.run --scaling          # units ∈ {1,2,4,8} vs accuracy
+
+# tests
+python -m tests.test_core
+python -m tests.test_persist
+```
+
+Python API:
+
+```python
+from core.hierarchy import HierarchicalCGLM
+model = HierarchicalCGLM(n_levels=2, strides=(1,4), n_units=4,
+                         col_dim=2048, encoder="semantic",
+                         kwta_k=42, replay_cap=512)
+model.train(corpus_sequences, epochs=10)
+model.predict_next(["the","cat"], topn=3)
+model.generate(["the","cat"], n=5)
+model.similar("cat", k=5)
+```
+
+## Configuration (`modal_app.py`)
+
+`MODEL_CONFIG` controls the architecture; `col_dim` is the single source of truth
+for SDR width (encoder dim is forced to match).
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `n_levels` / `strides` | `2` / `(1,4)` | hierarchy depth & temporal scales |
+| `n_units` | `3` | voting columns per level |
+| `col_dim` | `2048` | SDR width / mini-column count |
+| `cells_per_col` | `8` | temporal context depth |
+| `fp_bits` / `index_bits` | `21` / `7` | fingerprint & identity-core bits |
+| `window` | `2` | semantic co-occurrence window |
+| `kwta_k` | `42` | lateral inhibition: winners kept |
+| `replay_cap` | `512` | hippocampal buffer size |
+| `max_segs` / `syn_per_seg` | `16` / `24` | per-cell capacity (drives memory) |
+
+> **Memory per column** ≈ `col_dim × cells_per_col × max_segs × syn_per_seg × 8 bytes`.
+> Keep `max_segs` modest on Modal; raise the container `memory` for larger models.
+
+## Benchmarks
+
+`benchmarks/run.py` reports **top-1 / top-3 / MRR / perplexity-proxy**, training
+time, model size, and segment count across three bundled corpora:
+
+| Dataset | Tests |
+|---|---|
+| `grammar` | deterministic transitions (learnability ceiling) |
+| `motifs`  | memorisation + generalisation of repeated phrases |
+| `natural` | real text from a bundled corpus file |
 
 ## How it compares to LLMs
 
 | | CGLM | Transformer LLM |
 |---|---|---|
-| Learning | Online Hebbian (synapse permanences) | Offline gradient descent |
-| Compute | CPU-only, seconds/epoch | GPU, hours–days |
-| Memory | Sparse (explicit synapse lists) | Dense weight matrices |
+| Learning | Online Hebbian + neuromodulation + replay | Offline gradient descent |
+| Compute | Binary SDR algebra; CPU or GPU | GPU, hours–days |
+| Memory | Sparse SDRs; explicit synapses | Dense weight matrices |
 | Interpretability | High (traceable predictions) | Low |
 | Accuracy on general text | Low–moderate | State of the art |
 
-CGLM is not competing on perplexity — it explores whether sparse, biologically-inspired memory can produce useful predictions with a fraction of the compute.
+CGLM is not competing on perplexity — it explores whether sparse,
+biologically-inspired memory can produce useful predictions with a fraction of
+the compute, and whether brain-architecture mechanisms (hierarchy, inhibition,
+neuromodulation, replay) improve a backprop-free learner.
 
 ## License
 

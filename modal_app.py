@@ -1,5 +1,15 @@
 """
-CGLM Modal deployment.
+CGLM Modal deployment — Hierarchical Cortical-Grid Language Model.
+
+This deploys the modular brain-architecture model in ``core/``:
+  • hierarchical cortical levels with temporal strides
+  • k-WTA lateral inhibition
+  • neuromodulatory plasticity
+  • hippocampal replay
+  • sparse inter-area projections
+  • vectorised (GPU-ready) columns
+Persistence uses the compressed .npz store in ``persist/`` (model.cglm dir on
+the Volume) — ~1000× smaller than raw pickle of the dense segment arrays.
 
 Dataset lifecycle (one-time, shared across all versions):
   make upload-dataset  → downloads AllCombined.txt from Kaggle → /data/datasets/
@@ -10,13 +20,10 @@ Per-version workflow:
 
 Versioning:
   Bump VERSION to create a new independent deployment + volume subdir + registry entry.
-  fetch_corpus samples a random slice from the shared dataset for each version.
-  CORPUS_CONFIG and TRAIN_CONFIG are per-version.
 """
 from __future__ import annotations
 import datetime
 import json
-import pickle
 import subprocess
 import time
 from pathlib import Path
@@ -27,37 +34,44 @@ import modal
 # Version — bump to create a new independent deployment + isolated volume dir
 # ---------------------------------------------------------------------------
 
-VERSION = "v1"
+VERSION = "v2"
 
 # ---------------------------------------------------------------------------
 # Per-version configs
-# Corpus: start small so bootstrap finishes in < 2 min; scale up later.
-# Training: 1 epoch + 600 sequences ≈ 2-3 min on 4 CPUs.
-# Model arch: stable across versions; only change if you want to retrain from scratch.
+# Corpus: start small so bootstrap finishes quickly; scale up later.
+# Model arch: the hierarchical brain architecture. col_dim is the single source
+# of truth for SDR width (encoder dim is forced to match).
 # ---------------------------------------------------------------------------
 
 CORPUS_CONFIG = {
     "name": "plain-text-wikipedia-simpleenglish (ffatty/plain-text-wikipedia-simpleenglish)",
-    "max_chars": 60_000,  # → 400_000 once inference confirmed
+    "max_chars": 60_000,   # → 400_000 once inference confirmed
 }
 
 TRAIN_CONFIG = {
-    "epochs": 1,           # → 5 once inference confirmed
+    "epochs": 3,           # → more once inference confirmed
     "max_sequences": 600,  # → 3000 once inference confirmed
     "test_fraction": 0.15,
+    "replay_every": 2,     # hippocampal replay cadence (epochs)
 }
 
+# Memory note (per column): n_cells × max_segs × syn_per_seg × 4 bytes × 2 arrays
+#   n_cells = col_dim × cells_per_col.  Keep max_segs modest on Modal.
 MODEL_CONFIG = {
-    "n_columns": 3,
-    "dim": 2048,
-    "fp_bits": 21,
-    "index_bits": 7,
-    "window": 2,
-    "cells_per_col": 8,
-    "activation_threshold": 10,
-    "new_synapses": 24,
-    "max_segs_per_cell": 5,
+    "n_levels": 2,
+    "strides": (1, 4),         # token level + phrase level
+    "n_units": 3,              # voting columns per level
+    "col_dim": 2048,           # SDR width / mini-column count
+    "cells_per_col": 8,        # temporal context depth
+    "fp_bits": 21,             # active bits per fingerprint
+    "index_bits": 7,           # identity-core bits
+    "window": 2,               # semantic co-occurrence window
+    "kwta_k": 42,              # lateral inhibition: winners kept
+    "replay_cap": 512,         # hippocampal buffer size
     "periods": (7, 11, 13, 17, 19, 23),
+    "activation_threshold": 10,
+    "syn_per_seg": 24,
+    "max_segs": 16,
 }
 
 # ---------------------------------------------------------------------------
@@ -66,24 +80,31 @@ MODEL_CONFIG = {
 
 app = modal.App(f"cglm-chat-{VERSION}")
 vol = modal.Volume.from_name("cglm-data", create_if_missing=True)
-_VOL_MOUNT = "/data"                              # volume mount point (constant)
-VOL_PATH = Path(_VOL_MOUNT) / VERSION            # versioned subdirectory
-REGISTRY_PATH = Path(_VOL_MOUNT) / "registry.json"  # shared across all versions
+_VOL_MOUNT = "/data"                                 # volume mount point (constant)
+VOL_PATH = Path(_VOL_MOUNT) / VERSION                # versioned subdirectory
+REGISTRY_PATH = Path(_VOL_MOUNT) / "registry.json"   # shared across all versions
 DATASET_PATH = Path(_VOL_MOUNT) / "datasets" / "wikisimple-all.txt"  # shared raw dataset
+MODEL_DIR_NAME = "model.cglm"                         # persist/ store directory
 
+# The model now lives in the modular `core/` + `persist/` packages, added to
+# the image as directories under /root so `import core...` works in-container.
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("numpy", "fastapi", "uvicorn[standard]", "requests", "kaggle")
-    .add_local_file("model_core.py", "/root/model_core.py")
+    .add_local_dir("core", "/root/core")
+    .add_local_dir("persist", "/root/persist")
+    .add_local_dir("benchmarks", "/root/benchmarks")
 )
 
 nb_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("numpy", "jupyterlab", "matplotlib", "requests")
-    .add_local_file("model_core.py", "/root/model_core.py")
+    .add_local_dir("core", "/root/core")
+    .add_local_dir("persist", "/root/persist")
 )
 
 kaggle_secret = modal.Secret.from_name("kaggle-credentials")
+
 
 # ---------------------------------------------------------------------------
 # Registry helpers (run inside Modal containers)
@@ -164,7 +185,6 @@ def upload_dataset(force: bool = False) -> dict:
     url = f"https://www.kaggle.com/api/v1/datasets/download/{KAGGLE_DATASET}"
     print(f"Downloading {url} ...")
 
-    # Stream into memory (zip is ~50-80 MB compressed; text ~178 MB uncompressed)
     resp = requests.get(url, headers=auth, stream=True, allow_redirects=True, timeout=300)
     if resp.status_code == 403:
         raise RuntimeError(
@@ -186,13 +206,11 @@ def upload_dataset(force: bool = False) -> dict:
     with zipfile.ZipFile(zip_bytes) as zf:
         names = zf.namelist()
         print(f"Zip contents: {names}")
-        # Find AllCombined.txt (may be nested in a subdirectory)
         target = next((n for n in names if n.endswith(KAGGLE_FILE)), None)
         if target is None:
             raise RuntimeError(f"{KAGGLE_FILE} not found in zip. Contents: {names}")
         print(f"Extracting {target} → {DATASET_PATH} ...")
-        data = zf.read(target)
-        DATASET_PATH.write_bytes(data)
+        DATASET_PATH.write_bytes(zf.read(target))
 
     size_mb = DATASET_PATH.stat().st_size / 1_048_576
     vol.commit()
@@ -202,7 +220,6 @@ def upload_dataset(force: bool = False) -> dict:
 
 # ---------------------------------------------------------------------------
 # Corpus sampling — reads from shared dataset, no credentials required.
-# Each version can sample a different slice (via random seed = VERSION).
 # ---------------------------------------------------------------------------
 
 @app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=120)
@@ -212,16 +229,13 @@ def fetch_corpus(max_chars: int = CORPUS_CONFIG["max_chars"]) -> dict:
     versioned corpus path. No Kaggle credentials needed after upload_dataset.
     """
     import random
-    import re
 
     if not DATASET_PATH.exists():
         raise RuntimeError(
-            f"Raw dataset not found at {DATASET_PATH}. "
-            "Run 'make upload-dataset' first."
+            f"Raw dataset not found at {DATASET_PATH}. Run 'make upload-dataset' first."
         )
 
     file_size = DATASET_PATH.stat().st_size
-    # Pick a random start point so different versions get different slices
     rng = random.Random(VERSION)
     read_window = min(max_chars * 6, file_size)  # read 6× to have enough after filtering
     max_start = max(0, file_size - read_window)
@@ -231,10 +245,7 @@ def fetch_corpus(max_chars: int = CORPUS_CONFIG["max_chars"]) -> dict:
         fh.seek(start)
         raw = fh.read(read_window).decode("utf-8", errors="ignore")
 
-    # The file has articles separated by double newlines; split on those
     articles = [a.strip() for a in raw.split("\n\n") if len(a.strip()) > 80]
-
-    # Shuffle with a deterministic seed (VERSION-based) for reproducibility
     rng.shuffle(articles)
 
     all_text: list[str] = []
@@ -258,92 +269,69 @@ def fetch_corpus(max_chars: int = CORPUS_CONFIG["max_chars"]) -> dict:
 # Training with per-epoch metrics
 # ---------------------------------------------------------------------------
 
-@app.function(
-    image=image,
-    volumes={_VOL_MOUNT: vol},
-    timeout=300,  # hard cap: 5 min — increase if TRAIN_CONFIG epochs/sequences grow
-    cpu=4,
-)
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=600, cpu=4)
 def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
     import sys
     import random
     sys.path.insert(0, "/root")
-    from model_core import SemanticCorticalGridLM, tokenize, accuracy
+    from core.hierarchy import HierarchicalCGLM
+    from benchmarks.datasets import _tokenize          # shared tokenizer
+    from benchmarks.metrics import accuracy
+    from persist.store import save_model
 
     VOL_PATH.mkdir(parents=True, exist_ok=True)
     corpus_path = VOL_PATH / "corpus.txt"
     if not corpus_path.exists():
         return {"error": "corpus.txt not found — run fetch_corpus first"}
 
-    corpus = corpus_path.read_text(encoding="utf-8")
-    sequences = tokenize(corpus)
-    sequences = [s for s in sequences if len(s) >= 2]
+    sequences = [s for s in _tokenize(corpus_path.read_text(encoding="utf-8")) if len(s) >= 2]
     random.shuffle(sequences)
     sequences = sequences[:TRAIN_CONFIG["max_sequences"]]
 
     split = max(1, int(len(sequences) * test_fraction))
-    test_seq = sequences[:split]
-    train_seq = sequences[split:]
+    test_seq, train_seq = sequences[:split], sequences[split:]
+    E = TRAIN_CONFIG["epochs"]
+    print(f"[train] Train={len(train_seq)} Test={len(test_seq)} Epochs={E}")
 
-    print(f"[train] Train={len(train_seq)} seqs, Test={len(test_seq)} seqs, "
-          f"Epochs={TRAIN_CONFIG['epochs']}")
-
-    cfg = {**MODEL_CONFIG, "periods": tuple(MODEL_CONFIG["periods"])}
-    model = SemanticCorticalGridLM(**cfg)
+    cfg = {**MODEL_CONFIG,
+           "strides": tuple(MODEL_CONFIG["strides"]),
+           "periods": tuple(MODEL_CONFIG["periods"]),
+           "encoder": "semantic"}
+    model = HierarchicalCGLM(**cfg)
 
     epoch_metrics: list[dict] = []
-    for epoch in range(1, TRAIN_CONFIG["epochs"] + 1):
-        t0 = time.time()
-        if epoch == 1:
-            print(f"[train] epoch {epoch}: fitting encoders + training {len(train_seq)} sequences...")
-        else:
-            print(f"[train] epoch {epoch}: training {len(train_seq)} sequences...")
-        model.train_one_epoch(train_seq)
-        elapsed = time.time() - t0
-        print(f"[train] epoch {epoch}: done in {elapsed:.1f}s")
 
-        print(f"[train] epoch {epoch}: evaluating accuracy...")
+    def cb(epoch, total, burst, segs):
         t_acc = time.time()
         t1, t3 = accuracy(model, test_seq, max_probes=200)
-        tr1, tr3 = accuracy(model, train_seq[:100], max_probes=100)
-        stats = model.stats()
-        print(f"[train] epoch {epoch}: accuracy done in {time.time()-t_acc:.1f}s — "
-              f"test_top1={t1:.1f}% test_top3={t3:.1f}% "
-              f"train_top1={tr1:.1f}% "
-              f"vocab={stats['vocab']} segs={stats['segments_per_unit']} "
-              f"syns={stats['synapses_per_unit']}")
-
-        rec = {
-            "epoch": epoch,
-            "test_top1": t1,
-            "test_top3": t3,
-            "train_top1": tr1,
-            "train_top3": tr3,
-            "seconds": round(elapsed, 1),
-            "vocab": stats["vocab"],
-            "segments": stats["segments_per_unit"],
-            "synapses": stats["synapses_per_unit"],
-        }
+        tr1, _ = accuracy(model, train_seq[:100], max_probes=100)
+        rec = {"epoch": epoch, "test_top1": t1, "test_top3": t3,
+               "train_top1": tr1, "burst_rate": round(burst, 3),
+               "segments": int(segs), "neuromod": model.stats()["neuromod"]}
         epoch_metrics.append(rec)
+        print(f"[train] epoch {epoch}/{total}: test_top1={t1}% test_top3={t3}% "
+              f"train_top1={tr1}% burst={burst:.2f} segs={segs} "
+              f"(eval {time.time()-t_acc:.1f}s)")
 
-    print(f"[train] finalizing model and saving to {VOL_PATH}...")
-    t_save = time.time()
-    for u in model.units:
-        u.finalize()
+    t0 = time.time()
+    model.train(train_seq, epochs=E, replay_every=TRAIN_CONFIG["replay_every"],
+                progress_cb=cb)
+    train_seconds = round(time.time() - t0, 1)
 
-    (VOL_PATH / "model.pkl").write_bytes(pickle.dumps(model))
+    print(f"[train] saving model → {VOL_PATH/MODEL_DIR_NAME}")
+    save_model(model, str(VOL_PATH / MODEL_DIR_NAME))
     (VOL_PATH / "metrics.json").write_text(json.dumps(epoch_metrics, indent=2))
     _write_notebook(epoch_metrics)
     vol.commit()
-    print(f"[train] saved in {time.time()-t_save:.1f}s")
 
+    stats = model.stats()
     final = epoch_metrics[-1]
     return {
         "test_top1": final["test_top1"],
         "test_top3": final["test_top3"],
-        "vocab": final["vocab"],
+        "vocab": stats["vocab"],
         "train_sequences": len(train_seq),
-        "total_seconds": round(sum(m["seconds"] for m in epoch_metrics), 1),
+        "total_seconds": train_seconds,
         "epoch_metrics": epoch_metrics,
     }
 
@@ -351,97 +339,46 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
 def _write_notebook(epoch_metrics: list[dict]):
     vol_str = str(VOL_PATH)
     cells = [
-        {
-            "cell_type": "markdown",
-            "metadata": {},
-            "source": [f"# CGLM Analytics — {VERSION}\n", "Training curves and model performance."],
-        },
-        {
-            "cell_type": "code",
-            "execution_count": None,
-            "metadata": {},
-            "outputs": [],
-            "source": [
-                "import json, sys\n",
-                "sys.path.insert(0, '/root')\n",
-                "import matplotlib.pyplot as plt\n",
-                "\n",
-                f"metrics = {json.dumps(epoch_metrics)}\n",
-                "epochs = [m['epoch'] for m in metrics]\n",
-                "top1   = [m['test_top1'] for m in metrics]\n",
-                "top3   = [m['test_top3'] for m in metrics]\n",
-                "tr1    = [m['train_top1'] for m in metrics]\n",
-                "\n",
-                "fig, axes = plt.subplots(1, 2, figsize=(12, 4))\n",
-                "axes[0].plot(epochs, top1, 'o-', label='test top-1')\n",
-                "axes[0].plot(epochs, top3, 's-', label='test top-3')\n",
-                "axes[0].plot(epochs, tr1, '^--', label='train top-1')\n",
-                "axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('%')\n",
-                f"axes[0].set_title('Accuracy — {VERSION}'); axes[0].legend()\n",
-                "syns = [m['synapses'] for m in metrics]\n",
-                "segs = [m['segments'] for m in metrics]\n",
-                "axes[1].plot(epochs, syns, 'o-', label='synapses/unit')\n",
-                "axes[1].plot(epochs, segs, 's-', label='segments/unit')\n",
-                "axes[1].set_xlabel('Epoch')\n",
-                f"axes[1].set_title('Model Growth — {VERSION}'); axes[1].legend()\n",
-                "plt.tight_layout()\n",
-                f"plt.savefig('{vol_str}/training_curves.png', dpi=100)\n",
-                "plt.show()\n",
-            ],
-        },
-        {
-            "cell_type": "code",
-            "execution_count": None,
-            "metadata": {},
-            "outputs": [],
-            "source": [
-                "# Version history across all deployments\n",
-                "import json\n",
-                "registry = json.loads(open('/data/registry.json').read())\n",
-                "for r in registry:\n",
-                "    print(f\"{r['version']:6s}  top1={r.get('test_top1','?'):5}%  "
-                "top3={r.get('test_top3','?'):5}%  "
-                "vocab={r.get('vocab','?'):6}  epochs={r.get('epochs','?')}  "
-                "corpus={r.get('corpus_name','?')}  deployed={r.get('deployed_at','?')[:10]}\")\n",
-            ],
-        },
-        {
-            "cell_type": "code",
-            "execution_count": None,
-            "metadata": {},
-            "outputs": [],
-            "source": [
-                "import pickle\n",
-                f"model = pickle.loads(open('{vol_str}/model.pkl','rb').read())\n",
-                "prompts = ['the capital of', 'science is', 'history of the', 'water is']\n",
-                "for p in prompts:\n",
-                "    toks = p.split()\n",
-                "    gen = model.generate(toks, n=8)\n",
-                "    print(' '.join(gen))\n",
-            ],
-        },
-        {
-            "cell_type": "code",
-            "execution_count": None,
-            "metadata": {},
-            "outputs": [],
-            "source": [
-                "unit = model.units[0]\n",
-                "vocab = list(unit.token_sdr.keys())\n",
-                "print(f'Vocab size: {len(vocab)}')\n",
-                "print('Sample tokens:', vocab[:20])\n",
-            ],
-        },
+        {"cell_type": "markdown", "metadata": {},
+         "source": [f"# CGLM Analytics — {VERSION}\n", "Hierarchical brain-architecture model."]},
+        {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+         "source": [
+            "import json, sys\n",
+            "sys.path.insert(0, '/root')\n",
+            "import matplotlib.pyplot as plt\n\n",
+            f"metrics = {json.dumps(epoch_metrics)}\n",
+            "epochs = [m['epoch'] for m in metrics]\n",
+            "top1 = [m['test_top1'] for m in metrics]\n",
+            "top3 = [m['test_top3'] for m in metrics]\n",
+            "tr1  = [m['train_top1'] for m in metrics]\n\n",
+            "fig, axes = plt.subplots(1, 2, figsize=(12, 4))\n",
+            "axes[0].plot(epochs, top1, 'o-', label='test top-1')\n",
+            "axes[0].plot(epochs, top3, 's-', label='test top-3')\n",
+            "axes[0].plot(epochs, tr1, '^--', label='train top-1')\n",
+            f"axes[0].set_title('Accuracy — {VERSION}'); axes[0].legend()\n",
+            "axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('%')\n",
+            "burst = [m['burst_rate'] for m in metrics]\n",
+            "segs  = [m['segments'] for m in metrics]\n",
+            "axes[1].plot(epochs, burst, 'o-', label='burst rate')\n",
+            "ax2 = axes[1].twinx(); ax2.plot(epochs, segs, 's-', color='tab:red', label='segments')\n",
+            f"axes[1].set_title('Surprise & Growth — {VERSION}'); axes[1].set_xlabel('Epoch')\n",
+            "plt.tight_layout()\n",
+            f"plt.savefig('{vol_str}/training_curves.png', dpi=100)\n",
+            "plt.show()\n",
+         ]},
+        {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+         "source": [
+            "import sys; sys.path.insert(0, '/root')\n",
+            "from persist.store import load_model\n",
+            f"model = load_model('{vol_str}/{MODEL_DIR_NAME}')\n",
+            "for p in ['the capital of', 'science is', 'history of the', 'water is']:\n",
+            "    print(' '.join(model.generate(p.split(), n=8)))\n",
+         ]},
     ]
-    nb = {
-        "nbformat": 4,
-        "nbformat_minor": 5,
-        "metadata": {
-            "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-            "language_info": {"name": "python", "version": "3.11.0"},
-        },
-        "cells": cells,
-    }
+    nb = {"nbformat": 4, "nbformat_minor": 5,
+          "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+                       "language_info": {"name": "python", "version": "3.11.0"}},
+          "cells": cells}
     (VOL_PATH / "analytics.ipynb").write_text(json.dumps(nb, indent=2))
 
 
@@ -449,7 +386,7 @@ def _write_notebook(epoch_metrics: list[dict]):
 # Bootstrap — called once after each deploy to fetch + train + record
 # ---------------------------------------------------------------------------
 
-@app.function(image=image, secrets=[kaggle_secret], volumes={_VOL_MOUNT: vol}, timeout=200)
+@app.function(image=image, secrets=[kaggle_secret], volumes={_VOL_MOUNT: vol}, timeout=900)
 def bootstrap(force: bool = False):
     """Idempotent post-deploy pipeline: dataset check → corpus sample → train → registry."""
     import time as _time
@@ -457,12 +394,11 @@ def bootstrap(force: bool = False):
 
     VOL_PATH.mkdir(parents=True, exist_ok=True)
 
-    model_path = VOL_PATH / "model.pkl"
-    if model_path.exists() and not force:
+    model_marker = VOL_PATH / MODEL_DIR_NAME / "config.json"
+    if model_marker.exists() and not force:
         print(f"[{VERSION}] Model already exists — skipping. Use 'make redeploy' to force retrain.")
         return
 
-    # Step 0: ensure the shared raw dataset is present (download only if missing)
     if not DATASET_PATH.exists():
         print(f"[{VERSION}] Step 0/3: raw dataset not found — uploading from Kaggle...")
         t0 = _time.time()
@@ -476,12 +412,12 @@ def bootstrap(force: bool = False):
     t1 = _time.time()
     corpus_info = fetch_corpus.local(max_chars=CORPUS_CONFIG["max_chars"])
     print(f"[{VERSION}] Step 1/3: corpus ready — {corpus_info['articles']} articles, "
-          f"{corpus_info['chars']:,} chars  ({_time.time()-t1:.1f}s)  [{_time.time()-t_boot:.1f}s]")
+          f"{corpus_info['chars']:,} chars  ({_time.time()-t1:.1f}s)")
 
     print(f"[{VERSION}] Step 2/3: training...  [{_time.time()-t_boot:.1f}s]")
     t2 = _time.time()
     result = train.local(test_fraction=TRAIN_CONFIG["test_fraction"])
-    print(f"[{VERSION}] Step 2/3: training done ({_time.time()-t2:.1f}s)  [{_time.time()-t_boot:.1f}s]")
+    print(f"[{VERSION}] Step 2/3: training done ({_time.time()-t2:.1f}s)")
 
     if "error" in result:
         print(f"[{VERSION}] Training failed: {result['error']}")
@@ -504,13 +440,9 @@ def bootstrap(force: bool = False):
     _upsert_registry(entry)
     vol.commit()
 
-    total = _time.time() - t_boot
-    print(
-        f"[{VERSION}] ✓ bootstrap done in {total:.1f}s — "
-        f"test_top1={entry['test_top1']}%  test_top3={entry['test_top3']}%  "
-        f"vocab={entry['vocab']}  train_seqs={entry['train_sequences']}  "
-        f"train_time={entry['train_seconds']}s"
-    )
+    print(f"[{VERSION}] ✓ bootstrap done in {_time.time()-t_boot:.1f}s — "
+          f"test_top1={entry['test_top1']}%  test_top3={entry['test_top3']}%  "
+          f"vocab={entry['vocab']}  train_seqs={entry['train_sequences']}")
 
 
 # ---------------------------------------------------------------------------
@@ -563,7 +495,8 @@ CHAT_HTML = r"""<!DOCTYPE html>
   <div id="messages"></div>
   <div id="metrics-panel">
     vocab: <span id="m-vocab">&ndash;</span>
-    &nbsp;segments/unit: <span id="m-segs">&ndash;</span>
+    &nbsp;levels: <span id="m-levels">&ndash;</span>
+    &nbsp;segments: <span id="m-segs">&ndash;</span>
     &nbsp;test top-1: <span id="m-top1">&ndash;</span>
     &nbsp;test top-3: <span id="m-top3">&ndash;</span>
   </div>
@@ -596,7 +529,8 @@ async function loadStatus() {
       $('status-badge').textContent = 'model ready'; $('status-badge').className = 'ready';
     } else { $('status-badge').textContent = d.status || 'no model'; }
     $('m-vocab').textContent = d.vocab ?? '–';
-    $('m-segs').textContent = d.segments_per_unit ?? '–';
+    $('m-levels').textContent = d.levels ?? '–';
+    $('m-segs').textContent = d.segments_l0 ?? '–';
   } catch {}
   try {
     const r = await fetch('/metrics'); const d = await r.json();
@@ -644,22 +578,20 @@ setInterval(loadStatus, 30000);
 """
 
 
-@app.cls(
-    image=image,
-    volumes={_VOL_MOUNT: vol},
-    min_containers=1,
-)
+@app.cls(image=image, volumes={_VOL_MOUNT: vol}, min_containers=1)
 class WebApp:
     @modal.enter()
     def load(self):
         import sys
         sys.path.insert(0, "/root")
+        from persist.store import load_model
+
         self.model = None
         self.metrics: list = []
-        model_path = VOL_PATH / "model.pkl"
-        if model_path.exists():
+        model_dir = VOL_PATH / MODEL_DIR_NAME
+        if (model_dir / "config.json").exists():
             try:
-                self.model = pickle.loads(model_path.read_bytes())
+                self.model = load_model(str(model_dir))
                 print(f"[{VERSION}] Model loaded.")
             except Exception as e:
                 print(f"[{VERSION}] Could not load model: {e}")
@@ -695,13 +627,20 @@ class WebApp:
             n = int(body.get("n", 10))
             if not self.model:
                 return JSONResponse({"error": "Model not loaded"}, status_code=503)
-            gen = self.model.generate(tokens, n=n)
-            return {"generated": gen}
+            return {"generated": self.model.generate(tokens, n=n)}
+
+        @api.get("/similar")
+        async def similar(word: str, k: int = 6):
+            if not self.model:
+                return JSONResponse({"error": "Model not loaded"}, status_code=503)
+            return {"word": word,
+                    "neighbours": [[t, o] for t, o in self.model.similar(word, k=k)]}
 
         @api.get("/stats")
         async def stats():
             if not self.model:
-                return {"model_loaded": False, "version": VERSION, "status": "no model — bootstrap in progress"}
+                return {"model_loaded": False, "version": VERSION,
+                        "status": "no model — bootstrap in progress"}
             s = self.model.stats()
             s["model_loaded"] = True
             s["version"] = VERSION
@@ -729,20 +668,12 @@ class WebApp:
 # JupyterLab analytics notebook
 # ---------------------------------------------------------------------------
 
-@app.function(
-    image=nb_image,
-    volumes={_VOL_MOUNT: vol},
-    timeout=3600,
-)
+@app.function(image=nb_image, volumes={_VOL_MOUNT: vol}, timeout=3600)
 @modal.web_server(8888)
 def notebook():
     subprocess.Popen([
         "jupyter", "lab",
-        "--ip=0.0.0.0",
-        "--port=8888",
-        "--no-browser",
-        "--allow-root",
-        "--NotebookApp.token=",
-        "--NotebookApp.password=",
+        "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root",
+        "--NotebookApp.token=", "--NotebookApp.password=",
         "--notebook-dir=/data",
     ])

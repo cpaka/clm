@@ -127,17 +127,27 @@ def fetch_corpus(max_chars: int = CORPUS_CONFIG["max_chars"]) -> dict:
     out_path = VOL_PATH / "corpus.txt"
 
     # Build auth header: KGAT Bearer or Basic username:key
-    api_token = os.environ.get("KAGGLE_API_TOKEN", "")
+    kaggle_keys = {k: v for k, v in os.environ.items() if "KAGGLE" in k.upper()}
+    print(f"Kaggle env vars present: {list(kaggle_keys.keys())}")
+
+    # Support all known env var names Kaggle CLI and SDK accept
+    api_token = (
+        os.environ.get("KAGGLE_API_TOKEN")
+        or os.environ.get("KAGGLE_KEY")
+        or ""
+    )
     username = os.environ.get("KAGGLE_USERNAME", "")
-    key = os.environ.get("KAGGLE_KEY", "")
 
     if api_token.startswith("KGAT"):
         auth_header = {"Authorization": f"Bearer {api_token}"}
-    elif username and key:
-        creds = base64.b64encode(f"{username}:{key}".encode()).decode()
+    elif username and api_token:
+        creds = base64.b64encode(f"{username}:{api_token}".encode()).decode()
         auth_header = {"Authorization": f"Basic {creds}"}
+    elif api_token:
+        # Token present but no username — try Bearer anyway (some newer keys work)
+        auth_header = {"Authorization": f"Bearer {api_token}"}
     else:
-        raise RuntimeError("No Kaggle credentials found in environment")
+        raise RuntimeError(f"No Kaggle credentials found. Env vars seen: {list(kaggle_keys.keys())}")
 
     # Download dataset zip via REST API v1
     url = f"https://www.kaggle.com/api/v1/datasets/download/{KAGGLE_DATASET}"

@@ -1,4 +1,4 @@
-.PHONY: deploy redeploy upload-dataset logs
+.PHONY: deploy redeploy upload-dataset logs train-parallel
 
 # Upload the raw Wikipedia dataset to the Modal Volume (one-time, shared across all versions).
 # Safe to re-run: skips download if the file already exists.
@@ -22,6 +22,11 @@ deploy:
 redeploy:
 	modal deploy modal_app.py
 	modal run modal_app.py::bootstrap --force
+
+# Train the voting units in parallel containers, then assemble + save the
+# ensemble (NEXT_STEPS #1). Requires a corpus already on the Volume (deploy first).
+train-parallel:
+	modal run modal_app.py::train_parallel
 
 # Tail logs for the running web app.
 logs:

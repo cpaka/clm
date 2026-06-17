@@ -201,6 +201,7 @@ class HierarchyLevel:
         cells_per_col: int,
         periods: tuple[int, ...],
         encoder_factory,           # callable(seed) → encoder (None for level ≥ 1)
+        seed_base: int = 0,
         **col_kwargs,
     ):
         self.level = level
@@ -216,7 +217,7 @@ class HierarchyLevel:
                 cells_per_col=cells_per_col,
                 periods=periods,
                 encoder=encoder_factory(i) if encoder_factory else None,
-                seed=i + level * 100,
+                seed=seed_base + i + level * 100,
                 **col_kwargs,
             )
             for i in range(n_units)
@@ -268,6 +269,7 @@ class HierarchicalCLM:
         kwta_k: int | None = None,
         replay_cap: int = 512,
         replay_thresh: float = 0.3,
+        seed_base: int = 0,
         **col_kwargs,
     ):
         assert len(strides) == n_levels, "strides must have one entry per level"
@@ -279,6 +281,9 @@ class HierarchicalCLM:
         self.fp_bits = fp_bits
         self.kwta_k = kwta_k if kwta_k is not None else fp_bits * 2
         self.encoder_type = encoder
+        # Offset applied to every unit/encoder seed — lets a standalone single-unit
+        # model reproduce "unit i" of a larger ensemble (used by parallel training).
+        self.seed_base = seed_base
 
         # Neuromodulatory signal (shared across level-0 units)
         self.neuromod = NeuromodSignal()
@@ -320,7 +325,7 @@ class HierarchicalCLM:
 
         enc_list = self._encoders or [
             TokenEncoder(dim=self._encoder_cfg["dim"],
-                         w=self.fp_bits, seed=i)
+                         w=self.fp_bits, seed=self.seed_base + i)
             for i in range(self.n_units)
         ]
 
@@ -344,6 +349,7 @@ class HierarchicalCLM:
                     col_dim=cdim,
                     w=w,
                     encoder_factory=ef,
+                    seed_base=self.seed_base,
                     **self._col_kwargs,
                 )
             )
@@ -370,11 +376,23 @@ class HierarchicalCLM:
         if self.encoder_type != "semantic":
             return
         self._encoders = [
-            SemanticEncoder(**self._encoder_cfg, seed=i)
+            SemanticEncoder(**self._encoder_cfg, seed=self.seed_base + i)
             for i in range(self.n_units)
         ]
         for enc in self._encoders:
             enc.fit(sequences)
+
+    def inject_units(self, units: list) -> None:
+        """Replace level-0 voting units with pre-trained CLMUnit objects.
+
+        Used by parallel training: each unit is trained standalone in its own
+        container, then assembled here into one ensemble. Only level-0 units
+        drive predict_next, so this fully defines the served model. Encoders are
+        repointed at the injected units for similar()/fingerprint()."""
+        self._build()
+        assert len(units) == len(self.levels[0].units), "unit count mismatch"
+        self.levels[0].units = list(units)
+        self._encoders = [u.enc for u in units]
 
     def train(
         self,

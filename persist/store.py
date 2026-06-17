@@ -56,6 +56,7 @@ def save_model(model: HierarchicalCLM, path: str) -> None:
         "col_dim": model.col_dim,
         "fp_bits": model.fp_bits,
         "kwta_k": model.kwta_k,
+        "seed_base": model.seed_base,
         "encoder": model.encoder_type,
         "encoder_cfg": model._encoder_cfg,
         "col_kwargs": {
@@ -117,6 +118,7 @@ def load_model(path: str) -> HierarchicalCLM:
     col_kwargs["periods"] = tuple(col_kwargs["periods"])
 
     # encoder_cfg already carries dim/fp_bits/index_bits/window
+    seed_base = cfg.get("seed_base", 0)
     model = HierarchicalCLM(
         n_levels=cfg["n_levels"],
         strides=tuple(cfg["strides"]),
@@ -124,6 +126,7 @@ def load_model(path: str) -> HierarchicalCLM:
         col_dim=cfg["col_dim"],
         kwta_k=cfg["kwta_k"],
         encoder=cfg["encoder"],
+        seed_base=seed_base,
         **cfg["encoder_cfg"],
         **col_kwargs,
     )
@@ -134,7 +137,7 @@ def load_model(path: str) -> HierarchicalCLM:
     # are restored from the enc_*.npz blobs below.
     if cfg["encoder"] == "semantic":
         model._encoders = [
-            SemanticEncoder(**cfg["encoder_cfg"], seed=i)
+            SemanticEncoder(**cfg["encoder_cfg"], seed=seed_base + i)
             for i in range(cfg["n_units"])
         ]
 

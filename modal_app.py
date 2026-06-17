@@ -64,12 +64,12 @@ VERSION = "v3"
 # training cost, so widen col_dim first when scaling.
 CORPUS_CONFIG = {
     "name": "plain-text-wikipedia-simpleenglish (ffatty/plain-text-wikipedia-simpleenglish)",
-    "max_chars": 40_000,   # → 400_000 when scaling up
+    "max_chars": 300_000,  # ~3000 sentences; enough for generalisation
 }
 
 TRAIN_CONFIG = {
-    "epochs": 2,           # → more when scaling up
-    "max_sequences": 150,  # → 3000 when scaling up  (~2 min on 4-CPU)
+    "epochs": 3,           # 3 passes; parallel units train in ~60s each
+    "max_sequences": 1000, # ~850 train / ~150 test
     "test_fraction": 0.15,
     "replay_every": 2,     # hippocampal replay cadence (epochs)
 }
@@ -375,6 +375,111 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
         "total_seconds": train_seconds,
         "epoch_metrics": epoch_metrics,
     }
+
+
+# ---------------------------------------------------------------------------
+# Parallel training — NEXT_STEPS #1: fan out the independent voting units
+# across containers, then assemble them into one ensemble.
+# ---------------------------------------------------------------------------
+
+def _load_split(test_fraction: float):
+    """Deterministic train/test split shared by every parallel unit so the
+    ensemble is coherent and evaluation is valid."""
+    import random
+    from benchmarks.datasets import _tokenize
+    seqs = [s for s in _tokenize((VOL_PATH / "corpus.txt").read_text(encoding="utf-8"))
+            if len(s) >= 2]
+    random.Random(0).shuffle(seqs)                 # fixed seed → same split everywhere
+    seqs = seqs[:TRAIN_CONFIG["max_sequences"]]
+    split = max(1, int(len(seqs) * test_fraction))
+    return seqs[split:], seqs[:split]              # train, test
+
+
+def _unit_cfg(seed_base: int) -> dict:
+    """Single-unit config = MODEL_CONFIG with one flat level, seeded as unit i."""
+    base = {k: v for k, v in MODEL_CONFIG.items()
+            if k not in ("n_levels", "strides", "n_units")}
+    base["periods"] = tuple(MODEL_CONFIG["periods"])
+    return dict(n_levels=1, strides=(1,), n_units=1, seed_base=seed_base,
+                encoder="semantic", **base)
+
+
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=600, cpu=2)
+def train_unit(unit_id: int) -> dict:
+    """Train ONE voting unit standalone and save it to unit_<id>.clm."""
+    import sys, time as _t
+    sys.path.insert(0, "/root")
+    from core.hierarchy import HierarchicalCLM
+    from persist.store import save_model
+
+    if not (VOL_PATH / "corpus.txt").exists():
+        return {"error": "corpus.txt not found"}
+    train_seq, _ = _load_split(TRAIN_CONFIG["test_fraction"])
+    t0 = _t.time()
+    m = HierarchicalCLM(**_unit_cfg(unit_id))
+    m.fit_encoders(train_seq)
+    m.train(train_seq, epochs=TRAIN_CONFIG["epochs"],
+            replay_every=TRAIN_CONFIG["replay_every"])
+    save_model(m, str(VOL_PATH / f"unit_{unit_id}.clm"))
+    vol.commit()
+    secs = round(_t.time() - t0, 1)
+    print(f"[unit {unit_id}] trained + saved in {secs}s")
+    return {"unit": unit_id, "seconds": secs, "vocab": m.stats()["vocab"]}
+
+
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900)
+def train_parallel() -> dict:
+    """Fan out unit training across containers, then assemble + save the ensemble."""
+    import sys, time as _t
+    sys.path.insert(0, "/root")
+    from core.hierarchy import HierarchicalCLM
+    from persist.store import load_model, save_model
+    from benchmarks.metrics import accuracy
+
+    N = MODEL_CONFIG["n_units"]
+    _set_status(phase="learning", message=f"Training {N} units in parallel…",
+                epoch=0, total_epochs=1, progress=0.1, metrics=[])
+    if not (VOL_PATH / "corpus.txt").exists():
+        _set_status(phase="error", message="corpus.txt not found — run fetch_corpus")
+        return {"error": "no corpus"}
+
+    t0 = _t.time()
+    results = list(train_unit.map(range(N)))       # parallel containers
+    print(f"[parallel] units done: {results}")
+
+    _set_status(phase="saving", message="Assembling ensemble…", progress=0.8)
+    vol.reload()                                   # see units written by other containers
+    shell = HierarchicalCLM(n_units=N, seed_base=0, **{
+        k: v for k, v in _unit_cfg(0).items() if k not in ("n_units", "seed_base")})
+    units = [load_model(str(VOL_PATH / f"unit_{i}.clm")).levels[0].units[0]
+             for i in range(N)]
+    shell.inject_units(units)
+
+    train_seq, test_seq = _load_split(TRAIN_CONFIG["test_fraction"])
+    t1, t3 = accuracy(shell, test_seq, max_probes=120)
+    tr1, _ = accuracy(shell, train_seq[:100], max_probes=100)
+    stats = shell.stats()
+    metrics = [{"epoch": 1, "test_top1": t1, "test_top3": t3, "train_top1": tr1,
+                "burst_rate": 0.0, "segments": stats["segments_l0"],
+                "neuromod": stats["neuromod"]}]
+    shell.metrics = metrics
+
+    save_model(shell, str(VOL_PATH / MODEL_DIR_NAME))
+    (VOL_PATH / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    total = round(_t.time() - t0, 1)
+    _upsert_registry({
+        "version": VERSION,
+        "deployed_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "corpus_name": CORPUS_CONFIG["name"] + " (parallel)",
+        "epochs": TRAIN_CONFIG["epochs"], "max_sequences": TRAIN_CONFIG["max_sequences"],
+        "test_top1": t1, "test_top3": t3, "vocab": stats["vocab"],
+        "train_sequences": len(train_seq), "train_seconds": total,
+    })
+    vol.commit()
+    _set_status(phase="done", progress=1.0, metrics=metrics,
+                message=f"Ensemble ready (parallel) — test top-1 {t1}%")
+    print(f"[parallel] assembled {N} units in {total}s — test_top1={t1}% top3={t3}%")
+    return {"units": N, "test_top1": t1, "test_top3": t3, "total_seconds": total}
 
 
 # ---------------------------------------------------------------------------

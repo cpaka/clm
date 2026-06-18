@@ -8,7 +8,9 @@ from __future__ import annotations
 import numpy as _np
 
 try:
-    import cupy as xp          # type: ignore[import-untyped]
+    import cupy as _cp          # type: ignore[import-untyped]
+    _cp.cuda.runtime.getDeviceCount()   # raises CUDARuntimeError if no GPU driver
+    xp = _cp
     _GPU = True
 
     def asnumpy(a):
@@ -19,7 +21,7 @@ try:
         """Host-to-device: numpy → cupy (or cupy → cupy no-op)."""
         return a if isinstance(a, xp.ndarray) else xp.asarray(a)
 
-except ImportError:
+except Exception:
     xp = _np                   # type: ignore[assignment]
     _GPU = False
 

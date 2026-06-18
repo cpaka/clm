@@ -468,12 +468,13 @@ def warmup_cupy() -> dict:
         return {"status": "cupy_not_available", "seconds": 0}
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900, gpu="t4")
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900, cpu=4)
 def train_unit(unit_id: int) -> dict:
     """Train ONE voting unit standalone and save it to unit_<id>.clm.
 
-    Requires cupy kernel cache to already be compiled (run `make warmup` once).
-    With a warm cache, GPU training completes in ~3–6 min per unit.
+    CPU training: HTM temporal memory is sequential (one token at a time),
+    so GPU kernel-launch overhead exceeds compute benefit for our array sizes.
+    4 CPU cores keeps memory bandwidth high for the numpy gather/reduce hot path.
     """
     import sys, time as _t
     sys.path.insert(0, "/root")
@@ -597,7 +598,7 @@ def _merge_columns(base_seg_idx, base_seg_perm, base_n_segs,
     return base_seg_idx, base_seg_perm, base_n_segs
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900, gpu="t4")
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900, cpu=4)
 def train_shard(args: tuple) -> dict:
     """Train a single CLMUnit on one corpus shard, save to shard_<id>.clm."""
     import sys, time as _t

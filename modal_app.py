@@ -122,22 +122,29 @@ def _set_status(**kw):
     cur.update(kw)
     status_dict[VERSION] = cur
 
+# cupy kernel cache — shared across all versions and all training containers.
+# cupy JIT-compiles CUDA kernels on first use and caches them under CUPY_CACHE_DIR.
+# By pointing that dir at the data Volume, the compiled kernels survive across
+# container restarts.  First cold-start: ~15 min compilation.  Warm: seconds.
+_CUPY_CACHE_PATH = "/data/cupy-cache"
+
 # The model now lives in the modular `core/` + `persist/` packages, added to
 # the image as directories under /root so `import core...` works in-container.
 image = (
     modal.Image.debian_slim(python_version="3.11")
     # Pin FastAPI + Pydantic v2 together — unpinned installs produced a
     # version mismatch where request-body models were misread as query params.
-    # cupy-cuda12x: GPU backend for column hot path on T4/A10 workers.
+    # cupy-cuda12x[ctk]: GPU backend + CUDA headers for JIT kernel compilation.
     # Falls back to numpy transparently on CPU-only containers (web serving,
     # assembly steps) because core/xp.py catches the ImportError.
-    # cupy-cuda12x[ctk] bundles CUDA headers needed for JIT kernel compilation
     .pip_install("numpy", "cupy-cuda12x[ctk]",
                  "fastapi==0.115.6", "pydantic>=2.5,<3",
                  "uvicorn[standard]==0.34.0", "requests", "kaggle")
+    .env({"CUPY_CACHE_DIR": _CUPY_CACHE_PATH})   # persist compiled kernels
     .add_local_dir("core", "/root/core")
     .add_local_dir("persist", "/root/persist")
     .add_local_dir("benchmarks", "/root/benchmarks")
+    .add_local_file("docs_html.py", "/root/docs_html.py")
 )
 
 kaggle_secret = modal.Secret.from_name("kaggle-credentials")
@@ -429,9 +436,13 @@ def _unit_cfg(seed_base: int) -> dict:
                 encoder="semantic", **base)
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900, gpu="t4")
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=3600, gpu="t4")
 def train_unit(unit_id: int) -> dict:
-    """Train ONE voting unit standalone and save it to unit_<id>.clm."""
+    """Train ONE voting unit standalone and save it to unit_<id>.clm.
+
+    First cold-start: cupy JIT-compiles CUDA kernels into CUPY_CACHE_DIR on the
+    Volume (~15 min).  Subsequent warm or cached starts skip compilation.
+    """
     import sys, time as _t
     sys.path.insert(0, "/root")
     from core.hierarchy import HierarchicalCLM
@@ -446,13 +457,13 @@ def train_unit(unit_id: int) -> dict:
     m.train(train_seq, epochs=TRAIN_CONFIG["epochs"],
             replay_every=TRAIN_CONFIG["replay_every"])
     save_model(m, str(VOL_PATH / f"unit_{unit_id}.clm"))
-    vol.commit()
+    vol.commit()   # also persists the cupy kernel cache to the volume
     secs = round(_t.time() - t0, 1)
     print(f"[unit {unit_id}] trained + saved in {secs}s")
     return {"unit": unit_id, "seconds": secs, "vocab": m.stats()["vocab"]}
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900)
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=3600)
 def train_parallel() -> dict:
     """Fan out unit training across containers, then assemble + save the ensemble."""
     import sys, time as _t
@@ -542,7 +553,7 @@ def _merge_columns(base_seg_idx, base_seg_perm, base_n_segs,
     return base_seg_idx, base_seg_perm, base_n_segs
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900, gpu="t4")
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=3600, gpu="t4")
 def train_shard(args: tuple) -> dict:
     """Train a single CLMUnit on one corpus shard, save to shard_<id>.clm."""
     import sys, time as _t
@@ -560,7 +571,7 @@ def train_shard(args: tuple) -> dict:
     m.train(train_seq, epochs=TRAIN_CONFIG["epochs"],
             replay_every=TRAIN_CONFIG["replay_every"])
     save_model(m, str(VOL_PATH / f"shard_{shard_id}.clm"))
-    vol.commit()
+    vol.commit()   # also persists the cupy kernel cache to the volume
     secs = round(_t.time() - t0, 1)
     print(f"[shard {shard_id}/{n_shards}] trained in {secs}s  vocab={m.stats()['vocab']}")
     return {"shard": shard_id, "seconds": secs, "vocab": m.stats()["vocab"],
@@ -894,6 +905,7 @@ CHAT_HTML = r"""<!DOCTYPE html>
     <button data-view="chat" class="active">Chat</button>
     <button data-view="dash">Dashboard</button>
     <button data-view="explore">Explore</button>
+    <a href="/docs" target="_blank" style="color:#94a3b8;text-decoration:none;padding:0.4rem 0.9rem;border-radius:0.6rem;font-size:0.85rem;font-weight:600;" onmouseover="this.style.background='#334155'" onmouseout="this.style.background=''">Docs ↗</a>
   </nav>
   <div id="status-badge">loading&hellip;</div>
 </header>
@@ -1151,12 +1163,17 @@ class WebApp:
     def serve(self):
         from fastapi import FastAPI
         from fastapi.responses import HTMLResponse, JSONResponse
+        from docs_html import DOCS_HTML
 
-        api = FastAPI(title="CLM Chat")
+        api = FastAPI(title="CLM Chat", docs_url=None, redoc_url=None)
 
         @api.get("/", response_class=HTMLResponse)
         async def index():
             return CHAT_HTML
+
+        @api.get("/docs", response_class=HTMLResponse)
+        async def docs():
+            return DOCS_HTML
 
         @api.post("/predict")
         async def predict(body: PredictReq):

@@ -325,7 +325,7 @@ so the ~15 min first-run JIT penalty is paid only once.
 ### Module map
 
 ```
-cglm_modal/
+clm/
 ├── core/
 │   ├── sdr.py          SDR primitives: convert, overlap, batch_overlap, make_sdr, kwta
 │   ├── grid.py         GridLocation — multi-scale path-integration location code

@@ -468,12 +468,12 @@ def warmup_cupy() -> dict:
         return {"status": "cupy_not_available", "seconds": 0}
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=300, gpu="t4")
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900, gpu="t4")
 def train_unit(unit_id: int) -> dict:
     """Train ONE voting unit standalone and save it to unit_<id>.clm.
 
     Requires cupy kernel cache to already be compiled (run `make warmup` once).
-    With a warm cache, GPU training completes in ~30–60s per unit.
+    With a warm cache, GPU training completes in ~3–6 min per unit.
     """
     import sys, time as _t
     sys.path.insert(0, "/root")
@@ -482,20 +482,32 @@ def train_unit(unit_id: int) -> dict:
 
     if not (VOL_PATH / "corpus.txt").exists():
         return {"error": "corpus.txt not found"}
+
+    t_load = _t.time()
     train_seq, _ = _load_split(TRAIN_CONFIG["test_fraction"])
-    t0 = _t.time()
+    print(f"[unit {unit_id}] corpus loaded in {_t.time()-t_load:.1f}s  ({len(train_seq)} seqs)")
+
+    t_enc = _t.time()
     m = HierarchicalCLM(**_unit_cfg(unit_id))
     m.fit_encoders(train_seq)
+    print(f"[unit {unit_id}] encoder fit in {_t.time()-t_enc:.1f}s  vocab={m.stats()['vocab']}")
+
+    t_train = _t.time()
     m.train(train_seq, epochs=TRAIN_CONFIG["epochs"],
             replay_every=TRAIN_CONFIG["replay_every"])
+    print(f"[unit {unit_id}] training done in {_t.time()-t_train:.1f}s")
+
+    t_save = _t.time()
     save_model(m, str(VOL_PATH / f"unit_{unit_id}.clm"))
-    vol.commit()   # also persists the cupy kernel cache to the volume
-    secs = round(_t.time() - t0, 1)
-    print(f"[unit {unit_id}] trained + saved in {secs}s")
-    return {"unit": unit_id, "seconds": secs, "vocab": m.stats()["vocab"]}
+    vol.commit()
+    print(f"[unit {unit_id}] saved in {_t.time()-t_save:.1f}s")
+
+    total = round(_t.time() - t_load, 1)
+    print(f"[unit {unit_id}] total {total}s")
+    return {"unit": unit_id, "seconds": total, "vocab": m.stats()["vocab"]}
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=300)
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900)
 def train_parallel() -> dict:
     """Fan out unit training across containers, then assemble + save the ensemble."""
     import sys, time as _t
@@ -585,7 +597,7 @@ def _merge_columns(base_seg_idx, base_seg_perm, base_n_segs,
     return base_seg_idx, base_seg_perm, base_n_segs
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=300, gpu="t4")
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900, gpu="t4")
 def train_shard(args: tuple) -> dict:
     """Train a single CLMUnit on one corpus shard, save to shard_<id>.clm."""
     import sys, time as _t

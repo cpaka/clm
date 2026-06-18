@@ -1,45 +1,58 @@
-.PHONY: deploy redeploy upload-dataset logs train-parallel train-shards ingest warmup
+.PHONY: deploy redeploy upload-dataset logs train-parallel train-shards ingest warmup bump-version fetch-corpus
 
 # One-time GPU kernel warm-up: compiles cupy CUDA kernels and caches them on the Volume.
-# Run this ONCE before the first `make train-parallel`. Takes ~15 min on cold start;
-# subsequent train runs complete in <5 min.
+# Run this ONCE before the first `make train-parallel`.
 warmup:
 	modal run modal_app.py::warmup_cupy
 
 # Upload the raw Wikipedia dataset to the Modal Volume (one-time, shared across all versions).
-# Safe to re-run: skips download if the file already exists.
 # Requires Kaggle credentials in the 'kaggle-credentials' Modal secret.
-# Before first run: accept the dataset license at
-#   https://www.kaggle.com/datasets/ffatty/plain-text-wikipedia-simpleenglish
 upload-dataset:
 	modal run modal_app.py::upload_dataset
 
-# Force re-download even if dataset file already exists.
 upload-dataset-force:
 	modal run modal_app.py::upload_dataset --force
 
-# Full deploy: push code to Modal, then auto-train (idempotent per VERSION).
-# If the raw dataset is already in the volume, bootstrap skips the download step.
+# ── Version management ─────────────────────────────────────────────────────────
+# Each bump doubles the corpus (v4→v4.1: 1M→2M chars, 5K→10K seqs, etc.)
+#
+#   make bump-version        # edit modal_app.py: increment VERSION + corpus size
+#   make fetch-corpus        # sample the new (larger) corpus from the dataset
+#   make train-parallel      # retrain on larger corpus
+#   make deploy              # push new version to Modal
+#
+# Or in one shot:  make bump-version fetch-corpus train-parallel deploy
+bump-version:
+	python bump_version.py
+
+bump-version-dry:
+	python bump_version.py --dry-run
+
+# Sample a corpus slice from the shared raw dataset (uses current CORPUS_CONFIG).
+fetch-corpus:
+	modal run modal_app.py::fetch_corpus
+
+# ── Deploy / train ─────────────────────────────────────────────────────────────
+
+# Full deploy: push code + auto-train (idempotent per VERSION).
 deploy:
 	modal deploy modal_app.py
 	modal run modal_app.py::bootstrap
 
-# Force retrain even if model.pkl already exists for this VERSION.
+# Force retrain even if a checkpoint exists for this VERSION.
 redeploy:
 	modal deploy modal_app.py
 	modal run modal_app.py::bootstrap --force
 
-# Train the voting units in parallel containers, then assemble + save the
-# ensemble (NEXT_STEPS #1). Requires a corpus already on the Volume (deploy first).
+# Train voting units in parallel containers, assemble ensemble.
 train-parallel:
 	modal run modal_app.py::train_parallel
 
-# Train N shards in parallel and merge segments for maximum corpus coverage (#2).
-# Increase n_shards to scale data throughput linearly.
+# Train N corpus shards in parallel, merge segments.
 train-shards:
 	modal run modal_app.py::train_shards
 
-# Run one incremental ingest pass (normally triggered by cron at 03:00 UTC, #6).
+# Run one incremental ingest pass (normally triggered by cron at 03:00 UTC).
 ingest:
 	modal run modal_app.py::ingest
 

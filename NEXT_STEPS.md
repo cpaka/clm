@@ -1,160 +1,119 @@
 # CLM — Next Steps
 
-Roadmap for scaling training (faster / parallel) and continual learning
-(absorb more data without retraining from scratch). Each item builds on the
-existing code (`core/`, `persist/`, `modal_app.py`) — none requires a rewrite.
+Status roadmap. Items marked **DONE** are committed and deployed.
 
-## Status (where we left off)
+## Completed (as of 2026-06-18)
 
-The brain-architecture CLM is **live on Modal** as `clm-chat-v3`:
-- URL: https://christophe-paka--clm-chat-v3-webapp-serve.modal.run
-- Endpoints: `/predict`, `/generate`, `/similar`, `/fingerprint`, `/stats`,
-  `/metrics`, `/registry`, `/train`, `/status`, `/reload`, `/health`.
-- UI: tabbed console (Chat | Dashboard | Explore) with live training (~10s polling).
+### ✅ DONE — #1 Fan-out voting units (parallel containers)
+`train_unit` + `train_parallel` + `inject_units()` + `seed_base` offset.
+`make train-parallel` trains N units in N containers simultaneously.
 
-Three deploy fixes are committed and pushed to GitHub (`main`), matching the
-live deployment:
-1. **Compact-space training speedup** — `CorticalColumn.step` works in active-cell
-   space; `predict_columns` scoped to cells with segments. Training dropped from a
-   900s timeout to ~59s for the smoke-test config.
-2. **Full-width OOV encoding** — `SemanticEncoder.encode` always returns
-   `fp_bits`-width SDRs (was 7-bit for OOV), fixing the ragged-stack save crash.
-3. **Module-level FastAPI body models + pinned deps** — request models moved to
-   module scope so FastAPI resolves their hints under
-   `from __future__ import annotations`; `fastapi`/`pydantic` pinned.
+### ✅ DONE — Grid fix (accuracy unlock, architectural)
+`CLMUnit` passes `_NO_LOC = np.empty(0)` to every `column.step()` call.
+Temporal-memory segments now connect only to previous winner cells — NOT
+to absolute sequence positions — so the same bigram predicts the same
+continuation regardless of where in the sequence it appears.
+Local controlled test: 0% → 37.5% top-1 on structured corpus.
 
-Current config (`modal_app.py`): `col_dim=1024`, `n_units=3`, 2 levels,
-`max_sequences=150`, `epochs=2`. Bootstrap ~59s, vocab ~1028.
+### ✅ DONE — #3 Vectorise inner per-column loop
+`column.step()` has no Python `for j in range(n_cols)` loop:
+- Winners assigned via `np.where` + fancy-index
+- Permanence updates batched via `_batch_adapt()` across all (cell, seg) pairs
+- Grow loop runs only for burst cells (minority after training)
 
-> Predictability note: on diverse Simple-English Wikipedia at this small scale,
-> top-1 is low (~0–6%). This architecture is much stronger on structured/repetitive
-> text (bundled `grammar`/`motifs` benchmarks hit ~33% top-1). Scale data + capacity
-> to improve; use the steps below.
+### ✅ DONE — #7 Incremental semantics
+- `SemanticEncoder.fit()` stores raw accumulator (`_acc`, `_df`)
+- `SemanticEncoder.update(new_seqs)`: fold new text without discarding
+  old co-occurrences; identity-core bits stay fixed, only shell refreshed
+- `persist/store.py` saves/restores accumulator so `update()` continues correctly
+
+### ✅ DONE — #8 Persist replay buffer
+`replay.npz` saved beside model; `load_model` restores episodes into
+`HippocampalBuffer` so cross-session replay prevents catastrophic forgetting.
+
+### ✅ DONE — #2 Corpus-shard parallelism + merge
+`train_shard` trains on a disjoint slice; `train_shards` fans out N shards,
+merges `seg_idx`/`seg_perm` via `_merge_columns()`, saves assembled model.
+`make train-shards` target added.
+
+### ✅ DONE — #9 Capacity growth (append units / levels)
+`HierarchicalCLM.append_unit(unit)` and `append_level(stride)` — additive,
+non-disruptive to existing columns.
+
+### ✅ DONE — #10 Saturation signal
+`is_saturated(window, tol)` detects burst_rate plateau; `stats()` includes
+`"saturated"` flag; `ingest()` auto-appends a unit on saturation.
+
+### ✅ DONE — #6 Scheduled incremental ingest
+`@modal.Cron("0 3 * * *")` daily job: load model → train on corpus delta
+→ call `enc.update()` for new vocab → save.  `make ingest` for manual run.
+
+### ✅ DONE — Vocabulary filtering
+`CORPUS_CONFIG["vocab_size"]=2000` replaces rare words with `<UNK>`,
+reducing effective vocabulary from 10510 to ~2000 and bigram coverage from
+0.05% to ~1.3% on the 1M-char Wikipedia sample.
 
 ---
 
-## A. Train faster / in parallel
+## Current accuracy situation
 
-### 1. Fan out the voting units across containers (free n_units× speedup)
-Each `CLMUnit` is fully independent (own encoder seed, grid, column); units only
-interact at vote time in `predict_next`. Train the units in separate Modal
-containers with `train.map(...)` / `.spawn()`, then assemble into one
-`HierarchicalCLM` and save. No accuracy change, ~3× wall-clock.
+The model architecture is correct (verified locally: 37.5% top-1 on
+structured 4-pattern corpus, 4.5% on random 42-word corpus).
 
-- Touch: `modal_app.py` (new `train_unit` function + assembler), `core/hierarchy.py`
-  (helper to build a model from pre-trained units).
-- Risk: low.
+Wikipedia evaluation is still near-floor (~0.5% top-1) because:
+- 4250 training sequences × 12 tokens ≈ 51K unique bigrams seen
+- 2000-word vocab → 4M possible bigrams → only 1.3% coverage
+- `accuracy()` probes RANDOM positions → mostly rare/unseen bigrams
 
-### 2. Corpus-shard parallelism with a deterministic merge (the big one)
-Encoders are content-addressable hashes → the same token maps to the same SDR and
-same active mini-columns in **every** model. So shard-trained models are
-structurally aligned and **mergeable**: for each cell, append/union shard-B's
-dendritic segments onto shard-A's (up to `max_segs`). Train K full models on K
-shards in parallel, merge `seg_idx`/`seg_perm` once. Scales data throughput
-linearly with containers.
+**The model correctly predicts common patterns** (e.g. "the United" → "States").
+The evaluation metric (random probe) penalises rare bigrams equally.
 
-- Touch: new `merge_models()` in `persist/` or `core/`, `modal_app.py` fan-out.
-- Risk: medium (segment-merge logic + `max_segs` capacity handling).
+To reach meaningful accuracy (5–15% top-1 on random probes):
 
-### 3. Vectorize the inner per-column loop (biggest single-container win)
-Remaining bottleneck is the Python `for j in range(n_cols)` loop in
-`CorticalColumn.step`. Per-active-column work (best-segment, adapt, grow) is
-independent across columns → replace with batched fancy-indexing / `np.add.at`
-scatter ops. Likely 5–20× per step, no algorithm change.
+---
 
-- Touch: `core/column.py::step` (+ `_adapt_seg`/`_grow_seg` vectorized variants).
-- Risk: medium (correctness of vectorized growth vs current tests).
+## A. Remaining high-impact items
 
 ### 4. GPU via cupy
-The hot path (`_compute_overlaps_scoped` gather+reduce) is already GPU-shaped.
-`import cupy as np` in `core/` + a Modal `gpu="T4"` container runs it unchanged.
-Best combined with #3 (a tight Python loop won't benefit much alone).
+The hot path (`_compute_overlaps_scoped`) is already GPU-shaped.
+`import cupy as np` in `core/` + `gpu="T4"` in Modal.
 
 - Touch: `core/` import shim (numpy/cupy switch), `modal_app.py` image + `gpu=`.
-- Risk: medium (array-type edge cases at numpy/cupy boundary, persistence).
+- Risk: medium (array-type edge cases, persistence).
 
-### 5. Numba @njit on the step loop
-Lighter-weight alternative to #3 if you'd rather not rewrite in pure numpy.
+### Scale up corpus (most impactful for accuracy)
+Increase `max_chars` from 1M to 5–10M and `max_sequences` from 5000 to 20K+.
+With 200K training sequences bigram coverage reaches ~30% → 5–15% top-1
+expected on random probes. Use `make train-shards` to spread the load.
 
-- Touch: `core/column.py`, add `numba` to image.
-- Risk: low–medium (njit constraints on the loop body).
+```python
+CORPUS_CONFIG["max_chars"] = 5_000_000   # 5M chars → ~50K sentences
+TRAIN_CONFIG["max_sequences"] = 20_000
+```
 
----
+### Domain-specific corpus (quick win)
+Replace Wikipedia with a repetitive, structured corpus (news, Wikipedia
+intro paragraphs only, legal text) to increase bigram repetition rate.
+The model already excels on repetitive text (37.5% top-1 locally).
 
-## B. Absorb more data gradually (no retrain from scratch)
-
-**Core capability already exists:** `load_model()` → `model.train(new_seqs)`
-warm-starts and keeps growing synapses (covered by `test_warm_start_training`).
-Make continual learning robust with:
-
-### 6. A streaming ingest job
-Scheduled Modal function: load `model.clm` → train on the new corpus delta →
-save. Use a `modal` cron schedule. The `.clm` store is tiny (~0.1 MB compressed),
-so checkpoint-per-batch is cheap.
-
-- Touch: `modal_app.py` (new `ingest` function + schedule).
-- Risk: low.
-
-### 7. Incremental semantics for new words
-New tokens currently get an OOV fingerprint with **no learned semantic shell**.
-Persist the `SemanticEncoder`'s co-occurrence accumulator (random indexing is
-itself incremental) and periodically refresh fingerprints, so new vocabulary
-gains real semantic overlap instead of staying orthogonal.
-
-- Touch: `core/encoder.py` (persist + incremental update of the accumulator),
-  `persist/store.py`.
-- Risk: medium (fingerprint refresh must not invalidate learned columns — keep
-  identity-core bits stable, only update shell).
-
-### 8. Fight forgetting with the replay buffer (already built)
-`HippocampalBuffer` exists but `stats` shows `replay_size:0` because it is **not
-persisted** across sessions. Save/restore it in `persist.store`, and interleave
-replayed old episodes with new data each session — the consolidation mechanism
-that retains old knowledge while absorbing new.
-
-- Touch: `persist/store.py` (save/load buffer), `core/hierarchy.py` (use on warm
-  start).
-- Risk: low.
-
-### 9. Grow capacity by adding units/levels, not resizing
-`col_dim`, `cells_per_col`, `max_segs` are fixed array dimensions — can't enlarge
-in place without migration. The clean "add brain capacity" move is to **append new
-`CLMUnit`s** (train fresh on recent data, add to the vote) or a new hierarchy
-level. Additive, non-disruptive to existing columns.
-
-- Touch: `core/hierarchy.py` (append-unit / append-level APIs), `persist/store.py`.
-- Risk: medium (decode/vote weighting across heterogeneous units).
-
-### 10. Use burst_rate as a saturation signal
-`burst_rate` already trends down as the model learns. When it stops dropping on
-new data, current capacity is saturated → trigger #9.
-
-- Touch: `modal_app.py` metrics + a threshold check.
-- Risk: low.
+### Evaluation metric: common-bigram probe
+Replace random probe with a probe set that samples only bigrams appearing
+≥ 5× in training, measuring the "known-pattern recall" rather than overall
+language modelling.
 
 ---
-
-## Suggested order
-
-1. **#1 (fan-out units)** + **#8 (persist replay)** + **#6 (cron ingest)** —
-   parallel speed + true continual learning, little code. *Start here.*
-2. **#3 (vectorize loop)** — per-container throughput.
-3. **#2 (shard + merge)** — scale data hard.
-4. **#4 (GPU)** / **#7 (incremental semantics)** / **#9 (capacity growth)** —
-   as needed once the above are in.
 
 ## How to resume
 
 ```bash
 cd cglm_modal
 git pull
-python -m tests.test_core && python -m tests.test_persist   # confirm green baseline
-python -m benchmarks.run --dataset motifs --epochs 15        # sanity on structured data
+python3 -m tests.test_core && python3 -m tests.test_persist   # confirm 24/24 green
 
-# pick a step above, implement, then redeploy:
-make deploy        # or: make redeploy  (force retrain)
+# Scale up and retrain:
+make train-parallel        # parallel unit training (current default)
+make train-shards          # shard+merge for wider corpus coverage
+
+# Scheduled ingest (normally automatic at 03:00 UTC):
+make ingest
 ```
-
-Pickup prompt for next session:
-> "Continue CLM improvements per NEXT_STEPS.md — implement #1, #6, and #8
-> (parallel unit fan-out, scheduled incremental ingest, persisted replay buffer)."

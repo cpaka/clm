@@ -61,6 +61,7 @@ VERSION = "v3"
 CORPUS_CONFIG = {
     "name": "plain-text-wikipedia-simpleenglish (ffatty/plain-text-wikipedia-simpleenglish)",
     "max_chars": 1_000_000,  # ~10K sentences; enough for bigram-level generalisation
+    "vocab_size": 2000,      # cap vocabulary; rare words → <UNK> (bigram coverage ~5%)
 }
 
 TRAIN_CONFIG = {
@@ -84,7 +85,7 @@ MODEL_CONFIG = {
     "kwta_k": 42,              # lateral inhibition: winners kept
     "replay_cap": 256,         # hippocampal buffer size
     "periods": (7, 11, 13, 17, 19, 23),
-    "activation_threshold": 5, # lower → fire on partial semantic match → better generalisation
+    "activation_threshold": 8,
     "syn_per_seg": 20,
     "max_segs": 16,            # more segment capacity before saturation
 }
@@ -378,15 +379,32 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
 # across containers, then assemble them into one ensemble.
 # ---------------------------------------------------------------------------
 
-def _load_split(test_fraction: float):
-    """Deterministic train/test split shared by every parallel unit so the
-    ensemble is coherent and evaluation is valid."""
+def _load_corpus_seqs() -> list[list[str]]:
+    """Load, shuffle (fixed seed), vocab-filter, and cap the corpus sequences.
+
+    Rare words beyond the top CORPUS_CONFIG['vocab_size'] are replaced with
+    '<UNK>'.  This keeps bigram coverage at ~5 % for better generalisation
+    even on a 1M-char Wikipedia sample."""
     import random
+    from collections import Counter
     from benchmarks.datasets import _tokenize
     seqs = [s for s in _tokenize((VOL_PATH / "corpus.txt").read_text(encoding="utf-8"))
             if len(s) >= 2]
-    random.Random(0).shuffle(seqs)                 # fixed seed → same split everywhere
-    seqs = seqs[:TRAIN_CONFIG["max_sequences"]]
+    random.Random(0).shuffle(seqs)
+
+    # Vocabulary filter
+    vocab_size = CORPUS_CONFIG.get("vocab_size", 0)
+    if vocab_size:
+        counter = Counter(w for seq in seqs for w in seq)
+        top_vocab = {w for w, _ in counter.most_common(vocab_size)}
+        seqs = [[w if w in top_vocab else "<UNK>" for w in seq] for seq in seqs]
+
+    return seqs[:TRAIN_CONFIG["max_sequences"]]
+
+
+def _load_split(test_fraction: float):
+    """Deterministic train/test split shared by every parallel unit."""
+    seqs = _load_corpus_seqs()
     split = max(1, int(len(seqs) * test_fraction))
     return seqs[split:], seqs[:split]              # train, test
 
@@ -483,14 +501,8 @@ def train_parallel() -> dict:
 # ---------------------------------------------------------------------------
 
 def _load_shard(shard_id: int, n_shards: int):
-    """Load the shard of training sequences assigned to `shard_id`."""
-    import random
-    from benchmarks.datasets import _tokenize
-    seqs = [s for s in _tokenize((VOL_PATH / "corpus.txt").read_text(encoding="utf-8"))
-            if len(s) >= 2]
-    random.Random(0).shuffle(seqs)
-    seqs = seqs[:TRAIN_CONFIG["max_sequences"]]
-    # Each shard is a contiguous slice (no overlap)
+    """Load the vocab-filtered corpus shard assigned to `shard_id`."""
+    seqs = _load_corpus_seqs()
     size = max(1, len(seqs) // n_shards)
     start = shard_id * size
     return seqs[start: start + size]

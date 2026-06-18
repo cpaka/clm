@@ -42,6 +42,7 @@ from .grid import GridLocation
 from .column import CorticalColumn
 from .modulation import NeuromodSignal
 from .replay import HippocampalBuffer
+from .xp import asnumpy
 
 
 # ── Projection layer (between levels) ────────────────────────────────────────
@@ -158,7 +159,7 @@ class CLMUnit:
         self.col.reset()
         for tok in tokens:
             self.col.step(self._sdr(tok), self._NO_LOC, learn=False)
-        pred_cols = self.col.predict_columns(self._NO_LOC)
+        pred_cols = asnumpy(self.col.predict_columns(self._NO_LOC))
         scores: dict[str, float] = defaultdict(float)
         for b in pred_cols:
             for tok in self._inv.get(int(b), ()):
@@ -170,7 +171,7 @@ class CLMUnit:
         self.col.reset()
         for tok in tokens:
             self.col.step(self._sdr(tok), self._NO_LOC, learn=False)
-        return self.col.last_winners.copy()
+        return asnumpy(self.col.last_winners)
 
     def reset(self) -> None:
         self.grid.reset()
@@ -483,7 +484,8 @@ class HierarchicalCLM:
         """Project level-(lvl-1) winners up to level-lvl and run one step."""
         if not level_features[lvl - 1]:
             return
-        prev_winners = level_features[lvl - 1][-1]
+        # asnumpy: winners may live on GPU; SparseProjection uses numpy matmul
+        prev_winners = asnumpy(level_features[lvl - 1][-1])
         ftr = self._projections[lvl - 1].project(prev_winners)
         no_loc = CLMUnit._NO_LOC
         for unit in self.levels[lvl].units:

@@ -1,9 +1,10 @@
 """
-core/column.py — Vectorised HTM-style cortical column.
+core/column.py — Vectorised HTM-style cortical column (numpy / cupy GPU backend).
 
-Key design: synaptic state lives in fixed-capacity numpy arrays so that the
-critical overlap computation is a single numpy gather + reduce — parallelisable
-on GPU (swap `np` for `cupy` with no other changes).
+Key design: synaptic state lives in fixed-capacity arrays on the configured
+backend (`xp`).  When cupy is available the arrays reside on GPU and the
+critical overlap computation is a single GPU gather + reduce.  On CPU the shim
+is transparent — behaviour is identical to the old numpy-only version.
 
 Storage layout
 --------------
@@ -24,12 +25,14 @@ Source index space
   source_dim (= n_cells+loc_dim) → sentinel (always inactive)
 
 #3 NEXT_STEPS: vectorised step() eliminates the Python per-column loop.
-  Winners are assigned via numpy fancy-indexing; permanence updates are batched
+  Winners are assigned via fancy-indexing; permanence updates are batched
   across all (cell, segment) pairs at once.  The grow loop runs only for burst
   cells (a shrinking minority as the model learns).
 """
 from __future__ import annotations
-import numpy as np
+import numpy as _np
+
+from .xp import xp, _GPU, asnumpy
 
 
 class CorticalColumn:
@@ -82,44 +85,67 @@ class CorticalColumn:
         self.syn_per_seg = syn_per_seg
         self.max_segs = max_segs
 
-        # Core state (fixed-size, vectorised)
-        self.seg_idx = np.full(
-            (self.n_cells, max_segs, syn_per_seg), self.source_dim, dtype=np.int32
+        # Core state (fixed-size, lives on xp backend — GPU if available)
+        self.seg_idx = xp.full(
+            (self.n_cells, max_segs, syn_per_seg), self.source_dim, dtype=xp.int32
         )
-        self.seg_perm = np.zeros(
-            (self.n_cells, max_segs, syn_per_seg), dtype=np.float32
+        self.seg_perm = xp.zeros(
+            (self.n_cells, max_segs, syn_per_seg), dtype=xp.float32
         )
-        self.n_segs = np.zeros(self.n_cells, dtype=np.int32)
+        self.n_segs = xp.zeros(self.n_cells, dtype=xp.int32)
 
-        self.rng = np.random.default_rng(seed)
-        self.prev_winners = np.zeros(self.n_cells, dtype=np.bool_)
-        self.last_winners = np.zeros(self.n_cells, dtype=np.bool_)
+        # RNG stays on CPU: grow operations are rare and small, and numpy's
+        # PCG generator is simpler to seed deterministically than cupy's.
+        self.rng = _np.random.default_rng(seed)
+
+        self.prev_winners = xp.zeros(self.n_cells, dtype=xp.bool_)
+        self.last_winners = xp.zeros(self.n_cells, dtype=xp.bool_)
         self.last_bursts = 0           # surprised columns in the last step
         self.last_active_cols = 0      # active columns in the last step
 
+    # ── Backend migration ────────────────────────────────────────────────────
+
+    def to_gpu(self) -> None:
+        """Transfer all state arrays to GPU (no-op if cupy unavailable)."""
+        if not _GPU:
+            return
+        self.seg_idx = xp.asarray(self.seg_idx)
+        self.seg_perm = xp.asarray(self.seg_perm)
+        self.n_segs = xp.asarray(self.n_segs)
+        self.prev_winners = xp.asarray(self.prev_winners)
+        self.last_winners = xp.asarray(self.last_winners)
+
+    def to_cpu(self) -> None:
+        """Transfer all state arrays to CPU numpy."""
+        self.seg_idx = _np.asarray(asnumpy(self.seg_idx))
+        self.seg_perm = _np.asarray(asnumpy(self.seg_perm))
+        self.n_segs = _np.asarray(asnumpy(self.n_segs))
+        self.prev_winners = _np.asarray(asnumpy(self.prev_winners))
+        self.last_winners = _np.asarray(asnumpy(self.last_winners))
+
     # ── Source vector ────────────────────────────────────────────────────────
 
-    def _build_source(self, loc_sdr: np.ndarray) -> np.ndarray:
+    def _build_source(self, loc_sdr: _np.ndarray) -> xp.ndarray:
         """
-        Build the (source_dim+1,) dense bool source vector.
+        Build the (source_dim+1,) dense bool source vector on the xp backend.
         Position `source_dim` is always False (sentinel for unused synapses).
         Passing an empty loc_sdr disables positional bits entirely.
         """
-        src = np.zeros(self.source_dim + 1, dtype=np.bool_)
+        src = xp.zeros(self.source_dim + 1, dtype=xp.bool_)
         src[: self.n_cells] = self.prev_winners
         if loc_sdr.size:
-            src[self.n_cells + loc_sdr] = True
+            src[self.n_cells + xp.asarray(loc_sdr)] = True
         return src
 
     # ── Vectorised overlap ───────────────────────────────────────────────────
 
-    def _compute_overlaps(self, src: np.ndarray):
+    def _compute_overlaps(self, src: _np.ndarray):
         """
         Compute connected and potential overlap for every (cell, segment).
 
         Parameters
         ----------
-        src : (source_dim+1,) bool  — padded source vector
+        src : (source_dim+1,) bool  — padded source vector (any backend)
 
         Returns
         -------
@@ -127,24 +153,26 @@ class CorticalColumn:
         pot_ov  : (n_cells, max_segs) int32
         valid   : (n_cells, max_segs) bool  — True for allocated segments
         """
-        # Gather source activity at every synapse: single numpy fancy-index
+        src = xp.asarray(src)
         syn_active = src[self.seg_idx]              # (n_cells, max_segs, syn_per_seg)
         syn_connected = self.seg_perm >= self.connected  # bool
         syn_valid = self.seg_idx < self.source_dim       # non-sentinel synapses
 
-        conn_ov = (syn_active & syn_connected & syn_valid).sum(axis=-1).astype(np.int32)
-        pot_ov = (syn_active & syn_valid).sum(axis=-1).astype(np.int32)
+        conn_ov = (syn_active & syn_connected & syn_valid).sum(axis=-1).astype(xp.int32)
+        pot_ov = (syn_active & syn_valid).sum(axis=-1).astype(xp.int32)
 
-        seg_range = np.arange(self.max_segs, dtype=np.int32)
+        seg_range = xp.arange(self.max_segs, dtype=xp.int32)
         valid = seg_range[None, :] < self.n_segs[:, None]
 
         return conn_ov, pot_ov, valid
 
-    def _compute_overlaps_scoped(self, src: np.ndarray, cells: np.ndarray):
+    def _compute_overlaps_scoped(self, src: xp.ndarray, cells: xp.ndarray):
         """
         Compact overlap for `cells` only — everything stays O(len(cells)),
         never O(n_cells).  This is the key training speedup: only ~2 % of
         columns are active per step.
+
+        Both `src` and `cells` must be on the xp backend.
 
         Returns compact arrays indexed by position in `cells`:
           conn_c : (A, max_segs) int  — connected overlap
@@ -159,12 +187,12 @@ class CorticalColumn:
         conn_c = (syn_active & syn_connected & syn_valid).sum(axis=-1)
         pot_c = (syn_active & syn_valid).sum(axis=-1)
 
-        seg_range = np.arange(self.max_segs, dtype=np.int32)
+        seg_range = xp.arange(self.max_segs, dtype=xp.int32)
         valid_c = seg_range[None, :] < self.n_segs[cells][:, None]
         return conn_c, pot_c, valid_c
 
     @staticmethod
-    def _best_seg_compact(pot_row: np.ndarray, n_seg: int) -> tuple[int, int]:
+    def _best_seg_compact(pot_row: xp.ndarray, n_seg: int) -> tuple[int, int]:
         """Best (segment_index, potential_overlap) from a compact pot row."""
         if n_seg == 0:
             return -1, 0
@@ -175,92 +203,98 @@ class CorticalColumn:
 
     def _batch_adapt(
         self,
-        cells: np.ndarray,
-        segs: np.ndarray,
-        src: np.ndarray,
+        cells: xp.ndarray,
+        segs: xp.ndarray,
+        src: xp.ndarray,
         inc: float,
         dec: float,
     ) -> None:
-        """Update permanences for a batch of (cell, seg) pairs in one numpy op."""
+        """Update permanences for a batch of (cell, seg) pairs — single GPU op."""
         if cells.size == 0:
             return
         idx_b = self.seg_idx[cells, segs]               # (B, syn_per_seg) int32
         valid_b = idx_b < self.source_dim                # (B, syn_per_seg) bool
-        safe = np.where(valid_b, idx_b, 0)
+        safe = xp.where(valid_b, idx_b, 0)
         active_b = src[safe] & valid_b                   # (B, syn_per_seg) bool
-        delta = np.where(active_b, inc,
-                         np.where(valid_b, -dec, 0.0)).astype(np.float32)
-        self.seg_perm[cells, segs] = np.clip(
+        delta = xp.where(active_b, inc,
+                         xp.where(valid_b, -dec, 0.0)).astype(xp.float32)
+        self.seg_perm[cells, segs] = xp.clip(
             self.seg_perm[cells, segs] + delta, 0.0, 1.0
         )
 
-    # ── Learning helpers ─────────────────────────────────────────────────────
+    # ── Learning helpers (CPU-side; grow ops are rare and small) ────────────
 
     def _grow_syn(
         self,
         cell: int,
         si: int,
-        active_src: np.ndarray,
+        active_src_cpu: _np.ndarray,
         grow_k: int,
     ) -> None:
-        """Grow up to `grow_k` new synapses on (cell, si) from active_src."""
+        """Grow up to `grow_k` new synapses on (cell, si).
+
+        `active_src_cpu` must be a CPU numpy array of active source indices.
+        """
         if grow_k <= 0:
             return
-        existing = self.seg_idx[cell, si]
-        valid_existing = existing[existing < self.source_dim]
-        candidates = active_src[~np.isin(active_src, valid_existing)]
+        existing_cpu = asnumpy(self.seg_idx[cell, si])   # pull one row to CPU
+        valid_existing = existing_cpu[existing_cpu < self.source_dim]
+        candidates = active_src_cpu[~_np.isin(active_src_cpu, valid_existing)]
         if not candidates.size:
             return
         self.rng.shuffle(candidates)
-        new_idx = candidates[:grow_k].astype(np.int32)
-        empty = np.where(existing >= self.source_dim)[0][: len(new_idx)]
-        self.seg_idx[cell, si, empty] = new_idx[: empty.size]
-        self.seg_perm[cell, si, empty] = self.init_perm
+        new_idx = candidates[:grow_k].astype(_np.int32)
+        empty = _np.where(existing_cpu >= self.source_dim)[0][: len(new_idx)]
+        if empty.size:
+            self.seg_idx[cell, si, empty] = xp.asarray(new_idx[: empty.size])
+            self.seg_perm[cell, si, empty] = self.init_perm
 
-    def _grow_seg(self, cell: int, active_src: np.ndarray) -> None:
-        """Allocate a new segment on `cell` from the precomputed active sources."""
-        if self.n_segs[cell] >= self.max_segs:
+    def _grow_seg(self, cell: int, active_src_cpu: _np.ndarray) -> None:
+        """Allocate a new segment on `cell` from CPU active source indices."""
+        n_segs_now = int(self.n_segs[cell])
+        if n_segs_now >= self.max_segs:
             return
-        si = int(self.n_segs[cell])
-        candidates = active_src.copy()
+        si = n_segs_now
+        candidates = active_src_cpu.copy()
         self.rng.shuffle(candidates)
-        chosen = candidates[: self.syn_per_seg].astype(np.int32)
-        self.seg_idx[cell, si, : len(chosen)] = chosen
+        chosen = candidates[: self.syn_per_seg].astype(_np.int32)
+        self.seg_idx[cell, si, : len(chosen)] = xp.asarray(chosen)
         self.seg_perm[cell, si, : len(chosen)] = self.init_perm
         self.n_segs[cell] += 1
 
-    # ── Main step (vectorised) ────────────────────────────────────────────────
+    # ── Main step (vectorised, GPU-accelerated) ───────────────────────────────
 
     def step(
         self,
-        feature_sdr: np.ndarray,
-        loc_sdr: np.ndarray,
+        feature_sdr: _np.ndarray,
+        loc_sdr: _np.ndarray,
         learn: bool = True,
         modulation: float = 1.0,
-    ) -> np.ndarray:
+    ) -> xp.ndarray:
         """
         Process one token.
 
-        Vectorised implementation (#3 NEXT_STEPS): winners are assigned via
-        numpy fancy-indexing; permanence updates are batched across all
-        (cell, segment) pairs; the grow loop runs only for burst cells.
+        Vectorised (#3 NEXT_STEPS) and GPU-accelerated (#4 NEXT_STEPS):
+        winners via fancy-indexing, permanence updates batched across all
+        (cell, segment) pairs, grow loop only for burst cells.
 
         Parameters
         ----------
-        feature_sdr : sorted int32 — active mini-column indices
+        feature_sdr : sorted int32 — active mini-column indices (CPU array)
         loc_sdr     : sorted int32 — active location bit indices (empty = no-op)
         modulation  : plasticity scalar from neuromodulatory signal [0..2]
 
         Returns
         -------
-        winners : (n_cells,) bool — active cells this step
+        winners : (n_cells,) bool on the xp backend (GPU if available)
         """
-        src = self._build_source(loc_sdr)
+        feature_sdr = xp.asarray(feature_sdr)          # CPU → GPU if needed
+        src = self._build_source(loc_sdr)               # xp bool vector
 
         n_cols = int(feature_sdr.size)
         cell_grid = (
-            feature_sdr.astype(np.int64)[:, None] * self.cpc
-            + np.arange(self.cpc, dtype=np.int64)[None, :]
+            feature_sdr.astype(xp.int64)[:, None] * self.cpc
+            + xp.arange(self.cpc, dtype=xp.int64)[None, :]
         )                                                   # (n_cols, cpc)
         active_cells = cell_grid.ravel()                    # (A = n_cols*cpc,)
         n_segs_c = self.n_segs[active_cells]
@@ -268,7 +302,7 @@ class CorticalColumn:
         conn_c, pot_c, valid_c = self._compute_overlaps_scoped(src, active_cells)
 
         predictive_c = ((conn_c >= self.activation_threshold) & valid_c).any(axis=1)
-        best_pot_c = np.where(valid_c, pot_c, -1).max(axis=1)              # (A,)
+        best_pot_c = xp.where(valid_c, pot_c, -1).max(axis=1)              # (A,)
 
         pred_col = predictive_c.reshape(n_cols, self.cpc)                  # (n_cols, cpc)
         bestpot_col = best_pot_c.reshape(n_cols, self.cpc)
@@ -277,16 +311,17 @@ class CorticalColumn:
         burst_mask = ~predicted_any
 
         # ── Winners (no Python per-column loop) ──────────────────────────────
-        winners = np.zeros(self.n_cells, dtype=np.bool_)
+        winners = xp.zeros(self.n_cells, dtype=xp.bool_)
 
         # Predicted: mark every cell whose segment fired
         if predicted_any.any():
-            pred_col_j, pred_r = np.where(pred_col)                        # (K,) each
+            pred_col_j, pred_r = xp.where(pred_col)                        # (K,) each
             winners[cell_grid[pred_col_j, pred_r]] = True
 
         # Burst: one winner per burst col — cell with highest potential overlap
-        burst_col_j = np.where(burst_mask)[0]                              # (B,)
-        r_best = bestpot_col[burst_mask].argmax(axis=1) if burst_col_j.size else np.empty(0, np.intp)
+        burst_col_j = xp.where(burst_mask)[0]                              # (B,)
+        r_best = (bestpot_col[burst_mask].argmax(axis=1) if burst_col_j.size
+                  else xp.empty(0, xp.intp))
         if burst_col_j.size:
             winners[cell_grid[burst_col_j, r_best]] = True
 
@@ -297,7 +332,10 @@ class CorticalColumn:
         if learn:
             inc = self.inc * modulation
             dec = self.dec * modulation
-            active_src = np.where(src[: self.source_dim])[0].astype(np.int32)
+            # active_src computed on CPU: grow operations use numpy RNG
+            active_src_cpu = _np.where(
+                asnumpy(src[: self.source_dim])
+            )[0].astype(_np.int32)
 
             # --- Predicted cells: batch-adapt best segment ---
             if predicted_any.any():
@@ -305,24 +343,29 @@ class CorticalColumn:
                 nsegs_row = n_segs_c[rows]
                 pot_rows = pot_c[rows]                               # (K, max_segs)
 
-                # Vectorised best_seg per predictive cell
-                seg_range = np.arange(self.max_segs, dtype=np.int32)
+                # Vectorised best_seg per predictive cell (on GPU)
+                seg_range = xp.arange(self.max_segs, dtype=xp.int32)
                 valid_seg = seg_range[None, :] < nsegs_row[:, None]
-                masked_pot = np.where(valid_seg, pot_rows, -1)
+                masked_pot = xp.where(valid_seg, pot_rows, -1)
                 si_batch = masked_pot.argmax(axis=1)                 # (K,)
-                ov_batch = pot_rows[np.arange(len(si_batch)), si_batch]
+                ov_batch = pot_rows[xp.arange(len(si_batch)), si_batch]
                 has_seg = nsegs_row > 0
 
-                adapt_cells = active_cells[rows[has_seg]].astype(np.int64)
+                adapt_cells = active_cells[rows[has_seg]].astype(xp.int64)
                 adapt_segs = si_batch[has_seg]
-                grow_k_arr = np.maximum(0, self.syn_per_seg - ov_batch[has_seg])
+                grow_k_arr = xp.maximum(0, self.syn_per_seg - ov_batch[has_seg])
 
                 self._batch_adapt(adapt_cells, adapt_segs, src, inc, dec)
 
-                # Grow missing synapses (cell-by-cell, minority operation)
-                for i in np.where(grow_k_arr > 0)[0]:
-                    self._grow_syn(int(adapt_cells[i]), int(adapt_segs[i]),
-                                   active_src, int(grow_k_arr[i]))
+                # Grow missing synapses (CPU, minority operation)
+                if grow_k_arr.any():
+                    grow_k_cpu = asnumpy(grow_k_arr)
+                    adapt_cells_cpu = asnumpy(adapt_cells)
+                    adapt_segs_cpu = asnumpy(adapt_segs)
+                    for i in _np.where(grow_k_cpu > 0)[0]:
+                        self._grow_syn(int(adapt_cells_cpu[i]),
+                                       int(adapt_segs_cpu[i]),
+                                       active_src_cpu, int(grow_k_cpu[i]))
 
             # --- Burst cells: adapt existing segment or grow new one ---
             if burst_col_j.size:
@@ -330,45 +373,51 @@ class CorticalColumn:
                 nsegs_burst = n_segs_c[burst_rows]
                 pot_burst = pot_c[burst_rows]
 
-                seg_range = np.arange(self.max_segs, dtype=np.int32)
+                seg_range = xp.arange(self.max_segs, dtype=xp.int32)
                 valid_seg = seg_range[None, :] < nsegs_burst[:, None]
-                masked_pot = np.where(valid_seg, pot_burst, -1)
+                masked_pot = xp.where(valid_seg, pot_burst, -1)
                 si_burst = masked_pot.argmax(axis=1)                 # (B,)
-                ov_burst = pot_burst[np.arange(len(si_burst)), si_burst]
+                ov_burst = pot_burst[xp.arange(len(si_burst)), si_burst]
 
                 adapt_mask = (ov_burst >= self.min_threshold) & (nsegs_burst > 0)
                 burst_cells = cell_grid[burst_col_j, r_best]         # (B,) absolute cell ids
 
-                # Batch-adapt burst cells that have a good enough segment
+                # Batch-adapt burst cells that have a good enough segment (GPU)
                 if adapt_mask.any():
                     self._batch_adapt(burst_cells[adapt_mask], si_burst[adapt_mask],
                                       src, inc, dec)
 
-                # Grow new segments for the rest
-                for i in np.where(~adapt_mask)[0]:
-                    self._grow_seg(int(burst_cells[i]), active_src)
+                # Grow new segments for the rest (CPU)
+                adapt_mask_cpu = asnumpy(adapt_mask)
+                if not adapt_mask_cpu.all():
+                    burst_cells_cpu = asnumpy(burst_cells)
+                    for i in _np.where(~adapt_mask_cpu)[0]:
+                        self._grow_seg(int(burst_cells_cpu[i]), active_src_cpu)
 
         self.prev_winners = winners
         self.last_winners = winners
         return winners
 
-    def predict_columns(self, loc_next_sdr: np.ndarray) -> np.ndarray:
+    def predict_columns(self, loc_next_sdr: _np.ndarray) -> xp.ndarray:
         """
         Return predicted mini-column indices for the NEXT token,
         given current last_winners and the next location SDR.
+
+        Returns an xp array (GPU if available); callers that iterate over the
+        result should convert with `asnumpy()` or `np.asarray()`.
         """
-        src = np.zeros(self.source_dim + 1, dtype=np.bool_)
+        src = xp.zeros(self.source_dim + 1, dtype=xp.bool_)
         src[: self.n_cells] = self.last_winners
         if loc_next_sdr.size:
-            src[self.n_cells + loc_next_sdr] = True
+            src[self.n_cells + xp.asarray(loc_next_sdr)] = True
 
         # Only cells with ≥1 segment can be predictive — gather over those only.
-        cells = np.where(self.n_segs > 0)[0]
+        cells = xp.where(self.n_segs > 0)[0]
         if cells.size == 0:
-            return np.empty(0, dtype=np.int32)
+            return _np.empty(0, dtype=_np.int32)
         conn_c, _, valid_c = self._compute_overlaps_scoped(src, cells)
         predictive = ((conn_c >= self.activation_threshold) & valid_c).any(axis=1)
-        return np.unique((cells[predictive] // self.cpc).astype(np.int32))
+        return xp.unique((cells[predictive] // self.cpc).astype(xp.int32))
 
     def reset(self) -> None:
         """Clear temporal state (call before each new sequence)."""

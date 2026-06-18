@@ -49,18 +49,24 @@ class GenerateReq(BaseModel):
 # Version — bump to create a new independent deployment + isolated volume dir
 # ---------------------------------------------------------------------------
 
-VERSION = "v3"
+VERSION = "v4"
 
 # ---------------------------------------------------------------------------
 # Per-version configs
-# Corpus: start small so bootstrap finishes quickly; scale up later.
-# Model arch: the hierarchical brain architecture. col_dim is the single source
-# of truth for SDR width (encoder dim is forced to match).
+#
+# Corpus scaling plan (Wikipedia, incremental — compare accuracy at each step):
+#   V4.0  →  1M chars,  5K seqs  (GPU baseline, same data as v3)
+#   V4.1  →  2M chars, 10K seqs  (bump CORPUS_CONFIG + TRAIN_CONFIG, redeploy)
+#   V4.2  →  5M chars, 20K seqs  (same)
+#
+# GPU note: train_unit / train_shard run on T4 GPUs via cupy.  The web-serving
+# container and assembly steps (train_parallel / train_shards) run on CPU;
+# arrays are saved as numpy on disk via cupy's __array__ protocol.
 # ---------------------------------------------------------------------------
 
 CORPUS_CONFIG = {
     "name": "plain-text-wikipedia-simpleenglish (ffatty/plain-text-wikipedia-simpleenglish)",
-    "max_chars": 1_000_000,  # ~10K sentences; enough for bigram-level generalisation
+    "max_chars": 1_000_000,  # V4.0 baseline: ~1M chars → ~5K sentences
     "vocab_size": 2000,      # cap vocabulary; rare words → <UNK> (bigram coverage ~5%)
 }
 
@@ -122,7 +128,12 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     # Pin FastAPI + Pydantic v2 together — unpinned installs produced a
     # version mismatch where request-body models were misread as query params.
-    .pip_install("numpy", "fastapi==0.115.6", "pydantic>=2.5,<3",
+    # cupy-cuda12x: GPU backend for column hot path on T4/A10 workers.
+    # Falls back to numpy transparently on CPU-only containers (web serving,
+    # assembly steps) because core/xp.py catches the ImportError.
+    # cupy-cuda12x[ctk] bundles CUDA headers needed for JIT kernel compilation
+    .pip_install("numpy", "cupy-cuda12x[ctk]",
+                 "fastapi==0.115.6", "pydantic>=2.5,<3",
                  "uvicorn[standard]==0.34.0", "requests", "kaggle")
     .add_local_dir("core", "/root/core")
     .add_local_dir("persist", "/root/persist")
@@ -418,7 +429,7 @@ def _unit_cfg(seed_base: int) -> dict:
                 encoder="semantic", **base)
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900, cpu=2)
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900, gpu="t4")
 def train_unit(unit_id: int) -> dict:
     """Train ONE voting unit standalone and save it to unit_<id>.clm."""
     import sys, time as _t
@@ -531,7 +542,7 @@ def _merge_columns(base_seg_idx, base_seg_perm, base_n_segs,
     return base_seg_idx, base_seg_perm, base_n_segs
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900, cpu=2)
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900, gpu="t4")
 def train_shard(args: tuple) -> dict:
     """Train a single CLMUnit on one corpus shard, save to shard_<id>.clm."""
     import sys, time as _t

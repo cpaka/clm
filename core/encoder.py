@@ -105,20 +105,20 @@ class SemanticEncoder:
 
     # ── Corpus fitting ────────────────────────────────────────────────────
 
-    def fit(self, sequences: list[list[str]]) -> None:
-        """Build semantic fingerprints from a tokenised corpus."""
-        # IDF weights — rare context carries more signal
-        df: dict[str, int] = defaultdict(int)
+    def _accumulate(
+        self,
+        sequences: list[list[str]],
+        acc: dict,
+        df: dict,
+    ) -> set[str]:
+        """Fold `sequences` into existing accumulator and df dicts.
+        Returns the set of (new) vocab tokens seen."""
         for seq in sequences:
             for tok in seq:
                 df[tok] += 1
         total = sum(df.values())
         weight = {t: math.log(1.0 + total / c) for t, c in df.items()}
 
-        # Accumulate context into a float accumulator per token
-        acc: dict[str, np.ndarray] = defaultdict(
-            lambda: np.zeros(self.dim, np.float64)
-        )
         vocab: set[str] = set()
         for seq in sequences:
             n = len(seq)
@@ -131,8 +131,11 @@ class SemanticEncoder:
                     if j != i:
                         iv = self.index_vec(seq[j])
                         a[iv] += weight[seq[j]]
+        return vocab
 
-        # Build fingerprints
+    def _build_fp(self, vocab: set[str], acc: dict) -> None:
+        """Refresh fingerprints for `vocab` from accumulator.
+        Identity-core bits are stable; only the semantic shell is updated."""
         shell_quota = self.fp_bits - self.index_bits
         for tok in vocab:
             core = self.index_vec(tok)
@@ -148,8 +151,6 @@ class SemanticEncoder:
                     shell.append(int(b))
 
             bits = sorted(core_set | set(shell))
-
-            # Rare tokens: pad with random bits
             if len(bits) < self.fp_bits:
                 pad = make_sdr(self.dim, self.fp_bits, self.seed * 7919 + len(bits))
                 for b in pad:
@@ -159,6 +160,34 @@ class SemanticEncoder:
                         break
 
             self.fp[tok] = np.sort(np.array(bits[: self.fp_bits], dtype=np.int32))
+
+    def fit(self, sequences: list[list[str]]) -> None:
+        """Build semantic fingerprints from a tokenised corpus.
+
+        Stores the raw accumulator so that `update()` can fold in new data
+        without discarding learned co-occurrences (#7 NEXT_STEPS)."""
+        self._acc: dict[str, np.ndarray] = defaultdict(
+            lambda: np.zeros(self.dim, np.float64)
+        )
+        self._df: dict[str, int] = defaultdict(int)
+        vocab = self._accumulate(sequences, self._acc, self._df)
+        self._build_fp(vocab, self._acc)
+
+    def update(self, sequences: list[list[str]]) -> int:
+        """Incrementally fold new sequences into the encoder (#7 NEXT_STEPS).
+
+        Identity-core bits are NEVER changed for existing tokens, so learned
+        column activations remain valid.  Only the semantic shell is refreshed
+        for tokens that appear in `sequences`.
+
+        Returns the number of new vocabulary items added."""
+        if not hasattr(self, "_acc"):
+            self.fit(sequences)
+            return len(self.fp)
+        before = len(self.fp)
+        vocab = self._accumulate(sequences, self._acc, self._df)
+        self._build_fp(vocab, self._acc)
+        return len(self.fp) - before
 
     # ── Encoding ──────────────────────────────────────────────────────────
 

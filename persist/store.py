@@ -6,8 +6,10 @@ Format
 A directory named `<name>.clm/` containing:
   config.json          — hyperparameters and metrics
   enc_<l>_<u>.npz     — SemanticEncoder fingerprints for level l, unit u
+  enc_acc_<l>_<u>.npz — SemanticEncoder accumulator (for incremental updates)
   col_<l>_<u>.npz     — CorticalColumn arrays for level l, unit u
   token_sdr_<l>_<u>.npz — token→SDR mapping and inverted index
+  replay.npz           — HippocampalBuffer episodes (for cross-session replay)
 
 numpy .npz files are raw binary (ZIP container of .npy blobs); loading
 a 100 MB column takes ~50 ms on a fast SSD.  For larger models, the same
@@ -16,7 +18,7 @@ arrays can be memory-mapped by passing `mmap_mode="r"` to np.load.
 Usage
 -----
     save_model(model, "runs/my_model")
-    model2 = load_model("runs/my_model", sequences=seqs)  # warm-start ready
+    model2 = load_model("runs/my_model")  # warm-start ready
 """
 from __future__ import annotations
 import json
@@ -39,6 +41,9 @@ def checkpoint_path(base: str, name: str = "model") -> str:
 def save_model(model: HierarchicalCLM, path: str) -> None:
     """
     Persist all model state to `path` (directory created if needed).
+
+    Saves column synaptic state, token SDR maps, semantic encoder fingerprints
+    and accumulators (#7), replay buffer (#8), and config/metrics.
 
     Parameters
     ----------
@@ -85,14 +90,14 @@ def save_model(model: HierarchicalCLM, path: str) -> None:
             # Token SDR map + inverted index
             if unit._token_sdr:
                 tokens = list(unit._token_sdr.keys())
-                sdrs = np.stack([unit._token_sdr[t] for t in tokens])   # (V, w)
+                sdrs = np.stack([unit._token_sdr[t] for t in tokens])
                 np.savez_compressed(
                     root / f"token_sdr_{tag}.npz",
                     tokens=np.array(tokens, dtype=object),
                     sdrs=sdrs,
                 )
 
-            # SemanticEncoder fingerprints
+            # SemanticEncoder fingerprints + accumulator (#7)
             if isinstance(unit.enc, SemanticEncoder) and unit.enc.fp:
                 vocab = list(unit.enc.fp.keys())
                 fps = np.stack([unit.enc.fp[t] for t in vocab])
@@ -101,6 +106,31 @@ def save_model(model: HierarchicalCLM, path: str) -> None:
                     vocab=np.array(vocab, dtype=object),
                     fps=fps,
                 )
+                # Save accumulator so update() can continue from this state
+                if hasattr(unit.enc, "_acc") and unit.enc._acc:
+                    acc_vocab = list(unit.enc._acc.keys())
+                    acc_vecs = np.stack([unit.enc._acc[t] for t in acc_vocab])
+                    df_vals = np.array([unit.enc._df.get(t, 0) for t in acc_vocab],
+                                       dtype=np.int64)
+                    np.savez_compressed(
+                        root / f"enc_acc_{tag}.npz",
+                        vocab=np.array(acc_vocab, dtype=object),
+                        acc=acc_vecs,
+                        df=df_vals,
+                    )
+
+    # Replay buffer (#8) — persist surprise episodes for cross-session replay
+    if model.replay and model.replay.size:
+        seqs = []
+        bursts = []
+        for seq, br in model.replay._buf:
+            seqs.append(" ".join(seq))
+            bursts.append(br)
+        np.savez_compressed(
+            root / "replay.npz",
+            sequences=np.array(seqs, dtype=object),
+            burst_rates=np.array(bursts, dtype=np.float32),
+        )
 
 
 # ── Load ─────────────────────────────────────────────────────────────────────
@@ -110,6 +140,7 @@ def load_model(path: str) -> HierarchicalCLM:
     Restore a HierarchicalCLM from a saved directory.
 
     The returned model is ready for inference and incremental training.
+    Replay buffer (#8) and encoder accumulators (#7) are restored when present.
     """
     root = Path(path)
     cfg = json.loads((root / "config.json").read_text())
@@ -117,7 +148,6 @@ def load_model(path: str) -> HierarchicalCLM:
     col_kwargs = dict(cfg["col_kwargs"])
     col_kwargs["periods"] = tuple(col_kwargs["periods"])
 
-    # encoder_cfg already carries dim/fp_bits/index_bits/window
     seed_base = cfg.get("seed_base", 0)
     model = HierarchicalCLM(
         n_levels=cfg["n_levels"],
@@ -165,11 +195,30 @@ def load_model(path: str) -> HierarchicalCLM:
                     for b in sdr:
                         unit._inv[int(b)].append(tok)
 
-            # Encoder fingerprints
+            # Encoder fingerprints (#7: also restore accumulator)
             enc_file = root / f"enc_{tag}.npz"
             if enc_file.exists() and isinstance(unit.enc, SemanticEncoder):
                 data = np.load(enc_file, allow_pickle=True)
                 for tok, fp in zip(data["vocab"].tolist(), data["fps"]):
                     unit.enc.fp[tok] = fp.astype(np.int32)
+
+                acc_file = root / f"enc_acc_{tag}.npz"
+                if acc_file.exists():
+                    from collections import defaultdict as dd
+                    adat = np.load(acc_file, allow_pickle=True)
+                    unit.enc._acc = dd(lambda: np.zeros(unit.enc.dim, np.float64))
+                    unit.enc._df = dd(int)
+                    for tok, vec, dv in zip(
+                        adat["vocab"].tolist(), adat["acc"], adat["df"]
+                    ):
+                        unit.enc._acc[tok] = vec.astype(np.float64)
+                        unit.enc._df[tok] = int(dv)
+
+    # Replay buffer (#8)
+    replay_file = root / "replay.npz"
+    if replay_file.exists() and model.replay is not None:
+        data = np.load(replay_file, allow_pickle=True)
+        for seq_str, br in zip(data["sequences"].tolist(), data["burst_rates"].tolist()):
+            model.replay._buf.append((seq_str.split(" "), float(br)))
 
     return model

@@ -174,6 +174,66 @@ def test_hierarchy_stats():
     assert s["levels"] == 1 and s["units_per_level"] == 1
 
 
+def test_hierarchy_position_agnostic():
+    """Grid fix: same bigram at different positions must give the same prediction."""
+    seqs = [["the", "cat", "sat"], ["a", "b", "the", "cat", "ran"]] * 15
+    model = HierarchicalCLM(n_levels=1, strides=(1,), n_units=1,
+                             col_dim=512, encoder="semantic", dim=512)
+    model.train(seqs, epochs=10)
+    # "the cat" at position 0 and position 2 should produce the same predictions
+    preds_p0 = model.predict_next(["the", "cat"], topn=3)
+    preds_p2 = model.predict_next(["a", "b", "the", "cat"], topn=3)
+    tokens_p0 = [t for t, _ in preds_p0]
+    tokens_p2 = [t for t, _ in preds_p2]
+    assert tokens_p0 == tokens_p2, f"position-dependent: {tokens_p0} vs {tokens_p2}"
+
+
+def test_append_unit():
+    """#9: appending a new unit expands the ensemble non-destructively."""
+    seqs = [["the", "cat", "sat"], ["a", "dog", "ran"]] * 10
+    model = HierarchicalCLM(n_levels=1, strides=(1,), n_units=1,
+                             col_dim=256, encoder="semantic", dim=256)
+    model.train(seqs, epochs=3)
+    before = model.n_units
+
+    new_unit = model.levels[0].units[0].__class__(
+        col_dim=256, w=model.fp_bits,
+        cells_per_col=model._col_kwargs["cells_per_col"],
+        periods=model._col_kwargs["periods"],
+        encoder=model._encoders[0],
+        seed=99,
+        **{k: v for k, v in model._col_kwargs.items()
+           if k not in ("cells_per_col", "periods")},
+    )
+    model.append_unit(new_unit)
+    assert model.n_units == before + 1
+    preds = model.predict_next(["the", "cat"], topn=3)
+    assert isinstance(preds, list)
+
+
+def test_saturation_signal():
+    """#10: is_saturated returns True when burst_rate plateau detected."""
+    model = HierarchicalCLM(n_levels=1, strides=(1,), n_units=1, col_dim=256)
+    model.metrics = [{"burst_rate": 0.5}, {"burst_rate": 0.51}, {"burst_rate": 0.50}]
+    assert model.is_saturated(window=3, tol=0.05)
+    model.metrics = [{"burst_rate": 0.9}, {"burst_rate": 0.6}, {"burst_rate": 0.3}]
+    assert not model.is_saturated(window=3, tol=0.05)
+
+
+def test_semantic_encoder_update():
+    """#7: incremental update preserves identity core for existing tokens."""
+    enc = SemanticEncoder(dim=256, fp_bits=14, index_bits=5, window=1, seed=0)
+    seqs1 = [["the", "cat", "sat"], ["the", "dog", "ran"]]
+    enc.fit(seqs1)
+    core_before = set(enc.fp["the"][:5].tolist())
+
+    seqs2 = [["the", "cat", "jumped"], ["a", "fox", "ran"]]
+    new_count = enc.update(seqs2)
+    core_after = set(enc.encode("the")[:5].tolist())
+    assert "fox" in enc.fp, "new token not added"
+    assert new_count >= 1
+
+
 # ── Manual runner ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

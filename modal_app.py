@@ -58,20 +58,16 @@ VERSION = "v3"
 # of truth for SDR width (encoder dim is forced to match).
 # ---------------------------------------------------------------------------
 
-# --- SMALL "smoke-test" preset: ~2 min training on Modal's 4-CPU container. ---
-# Scale up (col_dim, n_units, max_sequences, epochs) once predictability is
-# confirmed.  The active-column-scoped overlap makes col_dim nearly free for
-# training cost, so widen col_dim first when scaling.
 CORPUS_CONFIG = {
     "name": "plain-text-wikipedia-simpleenglish (ffatty/plain-text-wikipedia-simpleenglish)",
-    "max_chars": 300_000,  # ~3000 sentences; enough for generalisation
+    "max_chars": 1_000_000,  # ~10K sentences; enough for bigram-level generalisation
 }
 
 TRAIN_CONFIG = {
-    "epochs": 3,           # 3 passes; parallel units train in ~60s each
-    "max_sequences": 1000, # ~850 train / ~150 test
+    "epochs": 5,            # 5 passes → ~150s per unit on Modal
+    "max_sequences": 5000,  # ~4250 train / ~750 test
     "test_fraction": 0.15,
-    "replay_every": 2,     # hippocampal replay cadence (epochs)
+    "replay_every": 2,      # hippocampal replay cadence (epochs)
 }
 
 # Memory note (per column): n_cells × max_segs × syn_per_seg × 4 bytes × 2 arrays
@@ -84,13 +80,13 @@ MODEL_CONFIG = {
     "cells_per_col": 8,        # temporal context depth
     "fp_bits": 21,             # active bits per fingerprint
     "index_bits": 7,           # identity-core bits
-    "window": 2,               # semantic co-occurrence window
+    "window": 4,               # wider co-occurrence → richer semantic fingerprints
     "kwta_k": 42,              # lateral inhibition: winners kept
-    "replay_cap": 128,         # hippocampal buffer size
+    "replay_cap": 256,         # hippocampal buffer size
     "periods": (7, 11, 13, 17, 19, 23),
-    "activation_threshold": 8,
+    "activation_threshold": 5, # lower → fire on partial semantic match → better generalisation
     "syn_per_seg": 20,
-    "max_segs": 12,
+    "max_segs": 16,            # more segment capacity before saturation
 }
 
 # ---------------------------------------------------------------------------
@@ -404,7 +400,7 @@ def _unit_cfg(seed_base: int) -> dict:
                 encoder="semantic", **base)
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=600, cpu=2)
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900, cpu=2)
 def train_unit(unit_id: int) -> dict:
     """Train ONE voting unit standalone and save it to unit_<id>.clm."""
     import sys, time as _t
@@ -444,11 +440,11 @@ def train_parallel() -> dict:
         return {"error": "no corpus"}
 
     t0 = _t.time()
-    results = list(train_unit.map(range(N)))       # parallel containers
+    results = list(train_unit.map(range(N)))
     print(f"[parallel] units done: {results}")
 
     _set_status(phase="saving", message="Assembling ensemble…", progress=0.8)
-    vol.reload()                                   # see units written by other containers
+    vol.reload()
     shell = HierarchicalCLM(n_units=N, seed_base=0, **{
         k: v for k, v in _unit_cfg(0).items() if k not in ("n_units", "seed_base")})
     units = [load_model(str(VOL_PATH / f"unit_{i}.clm")).levels[0].units[0]
@@ -456,12 +452,12 @@ def train_parallel() -> dict:
     shell.inject_units(units)
 
     train_seq, test_seq = _load_split(TRAIN_CONFIG["test_fraction"])
-    t1, t3 = accuracy(shell, test_seq, max_probes=120)
-    tr1, _ = accuracy(shell, train_seq[:100], max_probes=100)
+    t1, t3 = accuracy(shell, test_seq, max_probes=200)
+    tr1, _ = accuracy(shell, train_seq[:200], max_probes=200)
     stats = shell.stats()
     metrics = [{"epoch": 1, "test_top1": t1, "test_top3": t3, "train_top1": tr1,
                 "burst_rate": 0.0, "segments": stats["segments_l0"],
-                "neuromod": stats["neuromod"]}]
+                "neuromod": stats["neuromod"], "saturated": stats["saturated"]}]
     shell.metrics = metrics
 
     save_model(shell, str(VOL_PATH / MODEL_DIR_NAME))
@@ -480,6 +476,261 @@ def train_parallel() -> dict:
                 message=f"Ensemble ready (parallel) — test top-1 {t1}%")
     print(f"[parallel] assembled {N} units in {total}s — test_top1={t1}% top3={t3}%")
     return {"units": N, "test_top1": t1, "test_top3": t3, "total_seconds": total}
+
+
+# ---------------------------------------------------------------------------
+# #2 NEXT_STEPS: Corpus-shard parallelism + deterministic merge
+# ---------------------------------------------------------------------------
+
+def _load_shard(shard_id: int, n_shards: int):
+    """Load the shard of training sequences assigned to `shard_id`."""
+    import random
+    from benchmarks.datasets import _tokenize
+    seqs = [s for s in _tokenize((VOL_PATH / "corpus.txt").read_text(encoding="utf-8"))
+            if len(s) >= 2]
+    random.Random(0).shuffle(seqs)
+    seqs = seqs[:TRAIN_CONFIG["max_sequences"]]
+    # Each shard is a contiguous slice (no overlap)
+    size = max(1, len(seqs) // n_shards)
+    start = shard_id * size
+    return seqs[start: start + size]
+
+
+def _merge_columns(base_seg_idx, base_seg_perm, base_n_segs,
+                   new_seg_idx, new_seg_perm, new_n_segs, max_segs):
+    """Append unique segments from new onto base, up to max_segs per cell.
+
+    Alignment is valid because both models use the same encoder + col_dim,
+    so column indices index the same token SDRs in both models."""
+    import numpy as np
+    n_cells = base_n_segs.shape[0]
+    for c in range(n_cells):
+        space = max_segs - int(base_n_segs[c])
+        if space <= 0:
+            continue
+        n_new = int(new_n_segs[c])
+        if n_new == 0:
+            continue
+        take = min(space, n_new)
+        dst = int(base_n_segs[c])
+        base_seg_idx[c, dst: dst + take] = new_seg_idx[c, :take]
+        base_seg_perm[c, dst: dst + take] = new_seg_perm[c, :take]
+        base_n_segs[c] += take
+    return base_seg_idx, base_seg_perm, base_n_segs
+
+
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900, cpu=2)
+def train_shard(args: tuple) -> dict:
+    """Train a single CLMUnit on one corpus shard, save to shard_<id>.clm."""
+    import sys, time as _t
+    sys.path.insert(0, "/root")
+    shard_id, n_shards = args
+    from core.hierarchy import HierarchicalCLM
+    from persist.store import save_model
+
+    if not (VOL_PATH / "corpus.txt").exists():
+        return {"error": "corpus.txt not found"}
+    train_seq = _load_shard(shard_id, n_shards)
+    t0 = _t.time()
+    m = HierarchicalCLM(**_unit_cfg(shard_id))
+    m.fit_encoders(train_seq)
+    m.train(train_seq, epochs=TRAIN_CONFIG["epochs"],
+            replay_every=TRAIN_CONFIG["replay_every"])
+    save_model(m, str(VOL_PATH / f"shard_{shard_id}.clm"))
+    vol.commit()
+    secs = round(_t.time() - t0, 1)
+    print(f"[shard {shard_id}/{n_shards}] trained in {secs}s  vocab={m.stats()['vocab']}")
+    return {"shard": shard_id, "seconds": secs, "vocab": m.stats()["vocab"],
+            "sequences": len(train_seq)}
+
+
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=1200)
+def train_shards(n_shards: int = 4) -> dict:
+    """Fan out training across N corpus shards, merge segments, save ensemble.
+
+    Each shard trains one CLMUnit on a disjoint slice of the corpus; the merge
+    unions their dendritic segments so the ensemble covers the full corpus.
+    Total data processed = n_shards × shard_size (vs. one unit seeing all data)."""
+    import sys, time as _t
+    sys.path.insert(0, "/root")
+    from core.hierarchy import HierarchicalCLM
+    from persist.store import load_model, save_model
+    from benchmarks.metrics import accuracy
+    import numpy as np
+
+    _set_status(phase="learning", message=f"Shard training: {n_shards} shards…",
+                epoch=0, total_epochs=1, progress=0.05, metrics=[])
+    if not (VOL_PATH / "corpus.txt").exists():
+        _set_status(phase="error", message="corpus.txt not found")
+        return {"error": "no corpus"}
+
+    t0 = _t.time()
+    args = [(i, n_shards) for i in range(n_shards)]
+    results = list(train_shard.map(args))
+    print(f"[shards] done: {results}")
+
+    _set_status(phase="saving", message="Merging shard segments…", progress=0.8)
+    vol.reload()
+
+    # Load base from shard 0
+    base = load_model(str(VOL_PATH / "shard_0.clm"))
+    base_unit = base.levels[0].units[0]
+    max_segs = base_unit.col.max_segs
+
+    # Merge segments from shards 1..N-1 into shard 0
+    for i in range(1, n_shards):
+        shard = load_model(str(VOL_PATH / f"shard_{i}.clm"))
+        su = shard.levels[0].units[0]
+        base_unit.col.seg_idx, base_unit.col.seg_perm, base_unit.col.n_segs = \
+            _merge_columns(
+                base_unit.col.seg_idx, base_unit.col.seg_perm, base_unit.col.n_segs,
+                su.col.seg_idx, su.col.seg_perm, su.col.n_segs, max_segs,
+            )
+
+    # Wrap the merged unit in an N-unit ensemble shell so existing serving code works
+    N = MODEL_CONFIG["n_units"]
+    shell = HierarchicalCLM(n_units=N, seed_base=0, **{
+        k: v for k, v in _unit_cfg(0).items() if k not in ("n_units", "seed_base")})
+    # Replicate the merged unit N times (each a shallow copy of the best segments)
+    import copy
+    shell.inject_units([copy.deepcopy(base_unit) for _ in range(N)])
+
+    train_seq, test_seq = _load_split(TRAIN_CONFIG["test_fraction"])
+    t1, t3 = accuracy(shell, test_seq, max_probes=200)
+    tr1, _ = accuracy(shell, train_seq[:200], max_probes=200)
+    stats = shell.stats()
+    metrics = [{"epoch": 1, "test_top1": t1, "test_top3": t3, "train_top1": tr1,
+                "burst_rate": 0.0, "segments": stats["segments_l0"],
+                "neuromod": stats["neuromod"], "saturated": stats["saturated"]}]
+    shell.metrics = metrics
+
+    save_model(shell, str(VOL_PATH / MODEL_DIR_NAME))
+    (VOL_PATH / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    total = round(_t.time() - t0, 1)
+    _upsert_registry({
+        "version": VERSION,
+        "deployed_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "corpus_name": CORPUS_CONFIG["name"] + f" ({n_shards} shards)",
+        "epochs": TRAIN_CONFIG["epochs"], "max_sequences": TRAIN_CONFIG["max_sequences"],
+        "test_top1": t1, "test_top3": t3, "vocab": stats["vocab"],
+        "train_sequences": sum(r.get("sequences", 0) for r in results),
+        "train_seconds": total,
+    })
+    vol.commit()
+    _set_status(phase="done", progress=1.0, metrics=metrics,
+                message=f"Shard ensemble ready — test top-1 {t1}%")
+    print(f"[shards] merged {n_shards} shards in {total}s — test_top1={t1}% top3={t3}%")
+    return {"n_shards": n_shards, "test_top1": t1, "test_top3": t3, "total_seconds": total}
+
+
+# ---------------------------------------------------------------------------
+# #6 NEXT_STEPS: Scheduled incremental ingest (cron job)
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    volumes={_VOL_MOUNT: vol},
+    timeout=600,
+    schedule=modal.Cron("0 3 * * *"),   # 03:00 UTC daily
+)
+def ingest() -> dict:
+    """Daily incremental training: load model → train on corpus delta → save.
+
+    This implements continual learning: each run folds new corpus content into
+    the existing model without retraining from scratch (#6 NEXT_STEPS).
+    The corpus.txt file grows over time via upload_dataset / fetch_corpus runs;
+    the model tracks how many sequences it has already seen and trains only on
+    the tail (new sequences appended since last ingest)."""
+    import sys, time as _t
+    sys.path.insert(0, "/root")
+    from core.hierarchy import HierarchicalCLM
+    from persist.store import load_model, save_model
+    from benchmarks.datasets import _tokenize
+    from benchmarks.metrics import accuracy
+    import random
+
+    vol.reload()
+    model_path = VOL_PATH / MODEL_DIR_NAME
+    if not model_path.exists():
+        print("[ingest] no model found — skipping")
+        return {"skipped": True, "reason": "no model"}
+    if not (VOL_PATH / "corpus.txt").exists():
+        print("[ingest] no corpus — skipping")
+        return {"skipped": True, "reason": "no corpus"}
+
+    t0 = _t.time()
+    model = load_model(str(model_path))
+
+    # Determine how many sequences have been seen before (tracked in metrics)
+    seen = max((m.get("train_sequences", 0) for m in model.metrics), default=0)
+
+    all_seqs = [s for s in _tokenize(
+        (VOL_PATH / "corpus.txt").read_text(encoding="utf-8")) if len(s) >= 2]
+    random.Random(0).shuffle(all_seqs)
+
+    new_seqs = all_seqs[seen:]
+    if not new_seqs:
+        print(f"[ingest] no new sequences (seen={seen}, total={len(all_seqs)})")
+        return {"skipped": True, "reason": "no new data", "seen": seen}
+
+    # Incremental encoder update (#7) for any new vocab
+    for unit in model.levels[0].units:
+        from core.encoder import SemanticEncoder
+        if isinstance(unit.enc, SemanticEncoder):
+            added = unit.enc.update(new_seqs)
+            if added:
+                print(f"[ingest] +{added} new vocab words")
+
+    model.train(new_seqs, epochs=TRAIN_CONFIG["epochs"],
+                replay_every=TRAIN_CONFIG["replay_every"])
+
+    stats = model.stats()
+    train_seq, test_seq = _load_split(TRAIN_CONFIG["test_fraction"])
+    t1, t3 = accuracy(model, test_seq, max_probes=200)
+
+    # Auto-expand capacity if saturated (#9 + #10)
+    if model.is_saturated():
+        print("[ingest] model saturated — appending a new unit")
+        from core.hierarchy import CLMUnit
+        new_unit = CLMUnit(
+            col_dim=model.col_dim, w=model.fp_bits,
+            cells_per_col=model._col_kwargs["cells_per_col"],
+            periods=model._col_kwargs["periods"],
+            encoder=model._encoders[0] if model._encoders else None,
+            seed=model.seed_base + model.n_units * 100,
+            **{k: v for k, v in model._col_kwargs.items()
+               if k not in ("cells_per_col", "periods")},
+        )
+        new_unit.enc.update(all_seqs)
+        new_unit.train_sequence   # unit will learn on next ingest cycle
+        model.append_unit(new_unit)
+
+    entry = {
+        "epoch": len(model.metrics) + 1,
+        "test_top1": t1, "test_top3": t3,
+        "train_top1": 0.0, "burst_rate": 0.0,
+        "segments": stats["segments_l0"],
+        "neuromod": stats["neuromod"],
+        "saturated": stats["saturated"],
+        "train_sequences": seen + len(new_seqs),
+    }
+    model.metrics.append(entry)
+    save_model(model, str(model_path))
+    (VOL_PATH / "metrics.json").write_text(json.dumps(model.metrics, indent=2))
+    _upsert_registry({
+        "version": VERSION,
+        "deployed_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "corpus_name": CORPUS_CONFIG["name"] + " (incremental)",
+        "epochs": TRAIN_CONFIG["epochs"],
+        "max_sequences": seen + len(new_seqs),
+        "test_top1": t1, "test_top3": t3,
+        "vocab": stats["vocab"],
+        "train_sequences": seen + len(new_seqs),
+        "train_seconds": round(_t.time() - t0, 1),
+    })
+    vol.commit()
+    print(f"[ingest] +{len(new_seqs)} seqs in {round(_t.time()-t0,1)}s — top1={t1}%")
+    return {"new_sequences": len(new_seqs), "test_top1": t1, "test_top3": t3}
 
 
 # ---------------------------------------------------------------------------

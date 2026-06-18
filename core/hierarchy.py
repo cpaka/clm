@@ -119,48 +119,46 @@ class CLMUnit:
                 self._inv[int(b)].append(tok)
         return s
 
+    # Shared empty loc_sdr: grid location is NOT wired into temporal-memory
+    # segments so patterns generalise across positions.  Grid kept as object
+    # for potential future use (spatial feature encoding, replay indexing).
+    _NO_LOC = np.empty(0, dtype=np.int32)
+
     def train_sequence(self, tokens: list[str], modulation: float = 1.0) -> float:
         """
         Train on one sequence.  Returns burst rate (fraction of bursted columns).
         """
-        self.grid.reset()
         self.col.reset()
         bursts = total = 0
         for tok in tokens:
             ftr = self._sdr(tok)
-            winners = self.col.step(ftr, self.grid.sdr(), learn=True,
+            winners = self.col.step(ftr, self._NO_LOC, learn=True,
                                     modulation=modulation)
-            # Burst detection: any winner cell whose column had no prediction
             total += 1
             bursts += int(winners.any() and
                           not self.col.prev_winners[:self.col.n_cells].any())
-            self.grid.advance(1)
         return bursts / total if total else 0.0
 
     def train_feature_sequence(
         self, feature_sdrs: list[np.ndarray], modulation: float = 1.0
     ) -> float:
         """Train on a pre-projected feature SDR sequence (for level ≥ 1)."""
-        self.grid.reset()
         self.col.reset()
         bursts = total = 0
         for ftr in feature_sdrs:
-            winners = self.col.step(ftr, self.grid.sdr(), learn=True,
+            winners = self.col.step(ftr, self._NO_LOC, learn=True,
                                     modulation=modulation)
             total += 1
             bursts += int(winners.any() and
                           not self.col.prev_winners[:self.col.n_cells].any())
-            self.grid.advance(1)
         return bursts / total if total else 0.0
 
     def score_next(self, tokens: list[str]) -> dict[str, float]:
         """Run context and return token → normalised overlap score."""
-        self.grid.reset()
         self.col.reset()
         for tok in tokens:
-            self.col.step(self._sdr(tok), self.grid.sdr(), learn=False)
-            self.grid.advance(1)
-        pred_cols = self.col.predict_columns(self.grid.sdr())
+            self.col.step(self._sdr(tok), self._NO_LOC, learn=False)
+        pred_cols = self.col.predict_columns(self._NO_LOC)
         scores: dict[str, float] = defaultdict(float)
         for b in pred_cols:
             for tok in self._inv.get(int(b), ()):
@@ -169,11 +167,9 @@ class CLMUnit:
 
     def get_winners_after(self, tokens: list[str]) -> np.ndarray:
         """Run context, return last_winners dense bool for upward projection."""
-        self.grid.reset()
         self.col.reset()
         for tok in tokens:
-            self.col.step(self._sdr(tok), self.grid.sdr(), learn=False)
-            self.grid.advance(1)
+            self.col.step(self._sdr(tok), self._NO_LOC, learn=False)
         return self.col.last_winners.copy()
 
     def reset(self) -> None:
@@ -451,36 +447,27 @@ class HierarchicalCLM:
         if modulation is None:
             modulation = self.neuromod.modulation
 
+        no_loc = CLMUnit._NO_LOC
         step_counts = [0] * self.n_levels
         level_features: list[list[np.ndarray]] = [[] for _ in range(self.n_levels)]
 
-        # Level 0: process every token
         for unit in self.levels[0].units:
-            unit.grid.reset()
             unit.col.reset()
 
         bursts_l0 = active_l0 = 0
         for tok in seq:
-            # Feed token to all level-0 units
             for uid, unit in enumerate(self.levels[0].units):
                 ftr = unit._sdr(tok)
-                winners = unit.col.step(ftr, unit.grid.sdr(), learn=True,
-                                        modulation=modulation)
+                winners = unit.col.step(ftr, no_loc, learn=True, modulation=modulation)
                 if uid == 0:
-                    # Collect winners for projection upward (only unit 0 drives upper levels)
                     level_features[0].append(winners.copy())
-                    # Accumulate the true burst signal from the column itself
                     bursts_l0 += unit.col.last_bursts
                     active_l0 += unit.col.last_active_cols
-                unit.grid.advance(1)
 
             step_counts[0] += 1
-
-            # Feed upper levels when their stride is reached
             for lvl in range(1, self.n_levels):
                 if step_counts[0] % self.strides[lvl] == 0:
-                    self._step_upper_level(lvl, level_features, step_counts,
-                                          modulation)
+                    self._step_upper_level(lvl, level_features, step_counts, modulation)
 
         burst_rate = bursts_l0 / max(active_l0, 1)
         self.neuromod.update(burst_rate > 0.5)
@@ -494,17 +481,13 @@ class HierarchicalCLM:
         modulation: float,
     ) -> None:
         """Project level-(lvl-1) winners up to level-lvl and run one step."""
-        # Use the last winner from the level below
         if not level_features[lvl - 1]:
             return
         prev_winners = level_features[lvl - 1][-1]
-        proj = self._projections[lvl - 1]
-        ftr = proj.project(prev_winners)               # sparse feature SDR
-
+        ftr = self._projections[lvl - 1].project(prev_winners)
+        no_loc = CLMUnit._NO_LOC
         for unit in self.levels[lvl].units:
-            unit.col.step(ftr, unit.grid.sdr(), learn=True, modulation=modulation)
-            unit.grid.advance(1)
-
+            unit.col.step(ftr, no_loc, learn=True, modulation=modulation)
         level_features[lvl].append(
             self.levels[lvl].units[0].col.last_winners.copy()
         )
@@ -580,6 +563,74 @@ class HierarchicalCLM:
 
     # ── Utilities ─────────────────────────────────────────────────────────────
 
+    # ── Capacity growth (#9 NEXT_STEPS) ──────────────────────────────────────
+
+    def append_unit(self, unit: "CLMUnit") -> None:
+        """Add a pre-trained CLMUnit to level-0 and the encoder list.
+
+        The new unit must have the same col_dim / fp_bits as the ensemble.
+        It immediately participates in predict_next() voting.  Additive and
+        non-disruptive to existing units."""
+        self._build()
+        assert unit.col.col_dim == self.col_dim, "col_dim mismatch"
+        self.levels[0].units.append(unit)
+        self.n_units = len(self.levels[0].units)
+        if self._encoders is not None:
+            self._encoders.append(unit.enc)
+
+    def append_level(
+        self,
+        stride: int,
+        seed_base: int | None = None,
+    ) -> None:
+        """Add a new hierarchy level on top of the existing ones.
+
+        The new level trains via the inter-level projection mechanism the next
+        time train() is called.  Call after additional training data arrives."""
+        self._build()
+        new_lvl = self.n_levels
+        if seed_base is None:
+            seed_base = self.seed_base + new_lvl * 100
+
+        self.n_levels += 1
+        self.strides = self.strides + (stride,)
+
+        self.levels.append(
+            HierarchyLevel(
+                level=new_lvl,
+                stride=stride,
+                n_units=self.n_units,
+                col_dim=self.col_dim,
+                w=self.fp_bits,
+                encoder_factory=None,
+                seed_base=seed_base,
+                **self._col_kwargs,
+            )
+        )
+        # New projection from the last existing level up to the new one
+        n_cells_below = self.levels[new_lvl - 1].n_cells
+        self._projections.append(
+            SparseProjection(
+                in_dim=n_cells_below,
+                out_dim=self.col_dim,
+                out_k=self.fp_bits,
+                seed=new_lvl,
+            )
+        )
+
+    # ── Saturation (#10 NEXT_STEPS) ───────────────────────────────────────────
+
+    def is_saturated(self, window: int = 3, tol: float = 0.02) -> bool:
+        """Return True when burst_rate has plateaued over the last `window` epochs.
+
+        A plateau means capacity is saturated → time to call append_unit()."""
+        if len(self.metrics) < window:
+            return False
+        rates = [m.get("burst_rate", 1.0) for m in self.metrics[-window:]]
+        return (max(rates) - min(rates)) < tol
+
+    # ── Utilities ─────────────────────────────────────────────────────────────
+
     def _n_segments(self) -> int:
         return sum(u.col.n_segments for lvl in self.levels for u in lvl.units)
 
@@ -603,4 +654,5 @@ class HierarchicalCLM:
             ),
             "replay_size": self.replay.size if self.replay else 0,
             "neuromod": round(self.neuromod.modulation, 3),
+            "saturated": self.is_saturated(),
         }

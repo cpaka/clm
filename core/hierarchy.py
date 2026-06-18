@@ -83,6 +83,16 @@ class SparseProjection:
         scores = winners.astype(np.int32) @ self._proj   # (out_dim,)
         return dense_to_sparse(kwta(scores, self.out_k)).astype(np.int32)
 
+    def back_project_to_cells(self, pred_col_indices: np.ndarray) -> np.ndarray:
+        """Score in_dim source cells by connectivity to predicted output columns.
+
+        pred_col_indices : (P,) int — predicted level-1 mini-column indices
+        returns          : (in_dim,) float32 — connection count per source cell
+        """
+        if pred_col_indices.size == 0:
+            return np.zeros(self.in_dim, dtype=np.float32)
+        return self._proj[:, pred_col_indices].sum(axis=1).astype(np.float32)
+
 
 # ── One CLM unit (encoder + grid + column + inverted index) ─────────────────
 
@@ -126,18 +136,14 @@ class CLMUnit:
     _NO_LOC = np.empty(0, dtype=np.int32)
 
     def train_sequence(self, tokens: list[str], modulation: float = 1.0) -> float:
-        """
-        Train on one sequence.  Returns burst rate (fraction of bursted columns).
-        """
+        """Train on one sequence. Returns burst rate (burst cols / active cols)."""
         self.col.reset()
         bursts = total = 0
         for tok in tokens:
-            ftr = self._sdr(tok)
-            winners = self.col.step(ftr, self._NO_LOC, learn=True,
-                                    modulation=modulation)
-            total += 1
-            bursts += int(winners.any() and
-                          not self.col.prev_winners[:self.col.n_cells].any())
+            self.col.step(self._sdr(tok), self._NO_LOC, learn=True,
+                          modulation=modulation)
+            bursts += self.col.last_bursts
+            total += self.col.last_active_cols
         return bursts / total if total else 0.0
 
     def train_feature_sequence(
@@ -147,23 +153,24 @@ class CLMUnit:
         self.col.reset()
         bursts = total = 0
         for ftr in feature_sdrs:
-            winners = self.col.step(ftr, self._NO_LOC, learn=True,
-                                    modulation=modulation)
-            total += 1
-            bursts += int(winners.any() and
-                          not self.col.prev_winners[:self.col.n_cells].any())
+            self.col.step(ftr, self._NO_LOC, learn=True, modulation=modulation)
+            bursts += self.col.last_bursts
+            total += self.col.last_active_cols
         return bursts / total if total else 0.0
 
     def score_next(self, tokens: list[str]) -> dict[str, float]:
-        """Run context and return token → normalised overlap score."""
+        """Run context and return token → IDF-weighted normalised overlap score."""
         self.col.reset()
         for tok in tokens:
             self.col.step(self._sdr(tok), self._NO_LOC, learn=False)
         pred_cols = asnumpy(self.col.predict_columns(self._NO_LOC))
         scores: dict[str, float] = defaultdict(float)
         for b in pred_cols:
-            for tok in self._inv.get(int(b), ()):
-                scores[tok] += 1.0
+            toks = self._inv.get(int(b), ())
+            if toks:
+                idf = 1.0 / len(toks)   # rare bits discriminate more
+                for tok in toks:
+                    scores[tok] += idf
         return {t: v / self.w for t, v in scores.items()}
 
     def get_winners_after(self, tokens: list[str]) -> np.ndarray:
@@ -383,8 +390,7 @@ class HierarchicalCLM:
         """Replace level-0 voting units with pre-trained CLMUnit objects.
 
         Used by parallel training: each unit is trained standalone in its own
-        container, then assembled here into one ensemble. Only level-0 units
-        drive predict_next, so this fully defines the served model. Encoders are
+        container, then assembled here into one ensemble. Encoders are
         repointed at the injected units for similar()/fingerprint()."""
         self._build()
         assert len(units) == len(self.levels[0].units), "unit count mismatch"
@@ -501,21 +507,77 @@ class HierarchicalCLM:
         """
         Predict the next token given a context.
 
-        Votes are collected from all level-0 units; k-WTA sharpens the
-        aggregate column score before decoding via the inverted index.
+        Level-0 units vote via IDF-weighted token SDR overlap.  Upper levels
+        are driven at their natural temporal strides; their predicted feature
+        columns are back-projected into level-0 token space and blended at a
+        reduced weight (0.25).  k-WTA sharpens the aggregate score before
+        decoding.
 
         Returns list of (token, score) sorted descending.
         """
         self._build()
         raw_scores: dict[str, float] = defaultdict(float)
+
+        # Reset all levels before running context
+        for lvl in self.levels:
+            for unit in lvl.units:
+                unit.col.reset()
+
+        # Run context through all levels, mirroring the training stride pattern
+        l0_winners: list[np.ndarray] = [
+            np.zeros(self.levels[0].n_cells, dtype=bool) for _ in range(self.n_units)
+        ]
+        step_count = 0
+        for tok in tokens:
+            for uid, unit in enumerate(self.levels[0].units):
+                unit.col.step(unit._sdr(tok), CLMUnit._NO_LOC, learn=False)
+                l0_winners[uid] = asnumpy(unit.col.last_winners)
+            step_count += 1
+            for lvl in range(1, self.n_levels):
+                if step_count % self.strides[lvl] == 0:
+                    for uid in range(self.n_units):
+                        ftr = self._projections[lvl - 1].project(l0_winners[uid])
+                        self.levels[lvl].units[uid].col.step(
+                            ftr, CLMUnit._NO_LOC, learn=False
+                        )
+
+        # Level-0: IDF-weighted token scores from predicted columns
         for unit in self.levels[0].units:
-            for tok, sc in unit.score_next(tokens).items():
-                raw_scores[tok] += sc
+            pred_cols = asnumpy(unit.col.predict_columns(CLMUnit._NO_LOC))
+            for b in pred_cols:
+                toks = unit._inv.get(int(b), ())
+                if toks:
+                    idf = 1.0 / len(toks)
+                    for tok in toks:
+                        raw_scores[tok] += idf / unit.w
+
+        # Upper levels: back-project predicted feature columns → level-0 tokens
+        if self.n_levels > 1 and step_count >= self.strides[1]:
+            cpc = self.levels[0].units[0].col.cpc
+            upper_scores: dict[str, float] = defaultdict(float)
+            for uid, unit0 in enumerate(self.levels[0].units):
+                pred_l1 = asnumpy(
+                    self.levels[1].units[uid].col.predict_columns(CLMUnit._NO_LOC)
+                )
+                if pred_l1.size == 0:
+                    continue
+                cell_sc = self._projections[0].back_project_to_cells(pred_l1)
+                col_sc = cell_sc.reshape(self.col_dim, cpc).max(axis=1)
+                for col_idx in np.where(col_sc > 0)[0]:
+                    sc = float(col_sc[col_idx])
+                    for tok in unit0._inv.get(int(col_idx), ()):
+                        upper_scores[tok] += sc
+
+            if upper_scores:
+                max_upper = max(upper_scores.values())
+                if max_upper > 0:
+                    for tok, sc in upper_scores.items():
+                        raw_scores[tok] += 0.25 * sc / max_upper
 
         if not raw_scores:
             return []
 
-        # k-WTA on column scores for lateral inhibition
+        # k-WTA on aggregate scores for lateral inhibition
         all_tokens = list(raw_scores)
         scores_arr = np.array([raw_scores[t] for t in all_tokens])
         mask = kwta(scores_arr, self.kwta_k)

@@ -1,4 +1,10 @@
-.PHONY: deploy redeploy upload-dataset logs train-parallel train-shards ingest
+.PHONY: deploy redeploy upload-dataset logs train-parallel train-shards ingest warmup
+
+# One-time GPU kernel warm-up: compiles cupy CUDA kernels and caches them on the Volume.
+# Run this ONCE before the first `make train-parallel`. Takes ~15 min on cold start;
+# subsequent train runs complete in <5 min.
+warmup:
+	modal run modal_app.py::warmup_cupy
 
 # Upload the raw Wikipedia dataset to the Modal Volume (one-time, shared across all versions).
 # Safe to re-run: skips download if the file already exists.

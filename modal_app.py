@@ -436,12 +436,44 @@ def _unit_cfg(seed_base: int) -> dict:
                 encoder="semantic", **base)
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=3600, gpu="t4")
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=1800, gpu="t4")
+def warmup_cupy() -> dict:
+    """One-time cupy CUDA kernel compilation.
+
+    Run once with `make warmup` before the first `make train-parallel`.
+    Compiled kernels are stored at CUPY_CACHE_DIR (/data/cupy-cache) on the
+    persistent Volume, so train_unit / train_shard can start in <5 s thereafter.
+    This can take ~15 minutes on a cold T4 container.
+    """
+    import sys, time as _t
+    sys.path.insert(0, "/root")
+    t0 = _t.time()
+    try:
+        import cupy as cp
+        print("[warmup] cupy found — running kernel compilation warm-up…")
+        n = 8192 * 16 * 20
+        # Exercise the gather+reduce pattern used in column.step()
+        seg_idx = cp.random.randint(0, 1024, (n,), dtype=cp.int32)
+        src = cp.zeros(1024, dtype=cp.bool_)
+        src[:21] = True
+        _ = src[seg_idx].sum()          # triggers JIT: fancy-index + reduce
+        perm = cp.random.rand(n).astype(cp.float32)
+        _ = (src[seg_idx] & (perm >= 0.5)).sum()   # connected overlap pattern
+        cp.cuda.Stream.null.synchronize()
+        elapsed = round(_t.time() - t0, 1)
+        print(f"[warmup] kernels compiled in {elapsed}s — committing cache to volume")
+        vol.commit()
+        return {"status": "ok", "seconds": elapsed, "cache_dir": "/data/cupy-cache"}
+    except ImportError:
+        return {"status": "cupy_not_available", "seconds": 0}
+
+
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=300, gpu="t4")
 def train_unit(unit_id: int) -> dict:
     """Train ONE voting unit standalone and save it to unit_<id>.clm.
 
-    First cold-start: cupy JIT-compiles CUDA kernels into CUPY_CACHE_DIR on the
-    Volume (~15 min).  Subsequent warm or cached starts skip compilation.
+    Requires cupy kernel cache to already be compiled (run `make warmup` once).
+    With a warm cache, GPU training completes in ~30–60s per unit.
     """
     import sys, time as _t
     sys.path.insert(0, "/root")
@@ -463,7 +495,7 @@ def train_unit(unit_id: int) -> dict:
     return {"unit": unit_id, "seconds": secs, "vocab": m.stats()["vocab"]}
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=3600)
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=300)
 def train_parallel() -> dict:
     """Fan out unit training across containers, then assemble + save the ensemble."""
     import sys, time as _t
@@ -553,7 +585,7 @@ def _merge_columns(base_seg_idx, base_seg_perm, base_n_segs,
     return base_seg_idx, base_seg_perm, base_n_segs
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=3600, gpu="t4")
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=300, gpu="t4")
 def train_shard(args: tuple) -> dict:
     """Train a single CLMUnit on one corpus shard, save to shard_<id>.clm."""
     import sys, time as _t

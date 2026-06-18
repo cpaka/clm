@@ -49,7 +49,7 @@ class GenerateReq(BaseModel):
 # Version — bump to create a new independent deployment + isolated volume dir
 # ---------------------------------------------------------------------------
 
-VERSION = "v4"
+VERSION = "v4.1"
 
 # ---------------------------------------------------------------------------
 # Per-version configs
@@ -66,13 +66,13 @@ VERSION = "v4"
 
 CORPUS_CONFIG = {
     "name": "plain-text-wikipedia-simpleenglish (ffatty/plain-text-wikipedia-simpleenglish)",
-    "max_chars": 1_000_000,  # V4.0 baseline: ~1M chars → ~5K sentences
+    "max_chars": 2_000_000,  # V4.0 baseline: ~1M chars → ~5K sentences
     "vocab_size": 2000,      # cap vocabulary; rare words → <UNK> (bigram coverage ~5%)
 }
 
 TRAIN_CONFIG = {
     "epochs": 3,            # 3 passes — balanced speed/accuracy after batch-grow opt
-    "max_sequences": 5000,  # ~4250 train / ~750 test
+    "max_sequences": 10_000,  # ~8500 train / ~1500 test
     "test_fraction": 0.15,
     "replay_every": 2,      # hippocampal replay cadence (epochs)
 }

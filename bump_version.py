@@ -68,9 +68,7 @@ def bump(dry_run: bool = False):
         return
 
     def _fmt_int(n: int) -> str:
-        """Format large ints with underscores for readability."""
-        s = str(n)
-        return "_".join(s[max(0, i-3):i] for i in range(len(s), 0, -3))[::-1].lstrip("_") if len(s) > 3 else s
+        return f"{n:_}"
 
     new_text = text
     new_text = new_text.replace(f'VERSION = "{cur_ver}"', f'VERSION = "{new_ver}"', 1)

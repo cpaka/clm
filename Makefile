@@ -23,10 +23,10 @@ upload-dataset-force:
 #
 # Or in one shot:  make bump-version fetch-corpus train-parallel deploy
 bump-version:
-	python bump_version.py
+	python3 bump_version.py
 
 bump-version-dry:
-	python bump_version.py --dry-run
+	python3 bump_version.py --dry-run
 
 # Sample a corpus slice from the shared raw dataset (uses current CORPUS_CONFIG).
 fetch-corpus:

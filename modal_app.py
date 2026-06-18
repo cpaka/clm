@@ -71,7 +71,7 @@ CORPUS_CONFIG = {
 }
 
 TRAIN_CONFIG = {
-    "epochs": 5,            # 5 passes → ~150s per unit on Modal
+    "epochs": 3,            # 3 passes — balanced speed/accuracy after batch-grow opt
     "max_sequences": 5000,  # ~4250 train / ~750 test
     "test_fraction": 0.15,
     "replay_every": 2,      # hippocampal replay cadence (epochs)

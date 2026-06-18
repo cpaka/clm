@@ -262,6 +262,48 @@ class CorticalColumn:
         self.seg_perm[cell, si, : len(chosen)] = self.init_perm
         self.n_segs[cell] += 1
 
+    def _batch_grow_segs(self, cells_cpu: _np.ndarray,
+                         active_src_cpu: _np.ndarray) -> None:
+        """Grow one new segment per cell, vectorised (replaces Python loop).
+
+        All cells that still have room (n_segs < max_segs) get a new segment
+        with syn_per_seg randomly sampled synapses from active_src_cpu.
+        Uses a single GPU scatter write instead of one GPU round-trip per cell.
+        """
+        if not cells_cpu.size or not active_src_cpu.size:
+            return
+        n_segs_cpu = asnumpy(self.n_segs[cells_cpu])     # one GPU→CPU read
+        can_grow = n_segs_cpu < self.max_segs
+        if not can_grow.any():
+            return
+        grow_cells = cells_cpu[can_grow]                  # (B,) int32/int64
+        si_arr     = n_segs_cpu[can_grow].astype(_np.int32)  # (B,) target seg idx
+
+        B      = len(grow_cells)
+        n_src  = len(active_src_cpu)
+        n_take = min(n_src, self.syn_per_seg)
+
+        # Vectorised random sampling — one RNG call for all B cells
+        if n_src <= n_take:
+            # Fewer sources than synapses: every cell gets the same pattern
+            new_syns = _np.broadcast_to(
+                active_src_cpu[:n_take], (B, n_take)
+            ).copy().astype(_np.int32)
+        else:
+            # B × n_take random draws (sampling without replacement per cell
+            # is approximated by per-row shuffle; fast for small n_src)
+            rand_idx = self.rng.integers(0, n_src, size=(B, n_take))
+            new_syns = active_src_cpu[rand_idx].astype(_np.int32)   # (B, n_take)
+
+        # Single GPU scatter: seg_idx[grow_cells[b], si_arr[b], :n_take] = new_syns[b]
+        c_gpu   = xp.asarray(grow_cells.astype(_np.int64))
+        si_gpu  = xp.asarray(si_arr.astype(_np.int64))
+        rng_gpu = xp.arange(n_take, dtype=xp.int64)
+        self.seg_idx[c_gpu[:, None], si_gpu[:, None], rng_gpu[None, :]] = xp.asarray(new_syns)
+        self.seg_perm[c_gpu[:, None], si_gpu[:, None], rng_gpu[None, :]] = self.init_perm
+        # Update segment counts (single GPU write)
+        self.n_segs[c_gpu] = xp.asarray((si_arr + 1).astype(_np.int32))
+
     # ── Main step (vectorised, GPU-accelerated) ───────────────────────────────
 
     def step(
@@ -362,7 +404,8 @@ class CorticalColumn:
                     grow_k_cpu = asnumpy(grow_k_arr)
                     adapt_cells_cpu = asnumpy(adapt_cells)
                     adapt_segs_cpu = asnumpy(adapt_segs)
-                    for i in _np.where(grow_k_cpu > 0)[0]:
+                    need_grow = _np.where(grow_k_cpu > 0)[0]
+                    for i in need_grow:
                         self._grow_syn(int(adapt_cells_cpu[i]),
                                        int(adapt_segs_cpu[i]),
                                        active_src_cpu, int(grow_k_cpu[i]))
@@ -387,12 +430,14 @@ class CorticalColumn:
                     self._batch_adapt(burst_cells[adapt_mask], si_burst[adapt_mask],
                                       src, inc, dec)
 
-                # Grow new segments for the rest (CPU)
+                # Grow new segments for the rest — batched to avoid Python loop
                 adapt_mask_cpu = asnumpy(adapt_mask)
                 if not adapt_mask_cpu.all():
                     burst_cells_cpu = asnumpy(burst_cells)
-                    for i in _np.where(~adapt_mask_cpu)[0]:
-                        self._grow_seg(int(burst_cells_cpu[i]), active_src_cpu)
+                    self._batch_grow_segs(
+                        burst_cells_cpu[~adapt_mask_cpu].astype(_np.int64),
+                        active_src_cpu,
+                    )
 
         self.prev_winners = winners
         self.last_winners = winners

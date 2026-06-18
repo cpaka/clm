@@ -1,4 +1,4 @@
-.PHONY: deploy redeploy upload-dataset logs train-parallel train-shards ingest warmup bump-version fetch-corpus
+.PHONY: deploy redeploy upload-dataset logs train-parallel train-shards train-incremental ingest warmup bump-version fetch-corpus
 
 # One-time GPU kernel warm-up: compiles cupy CUDA kernels and caches them on the Volume.
 # Run this ONCE before the first `make train-parallel`.
@@ -47,6 +47,11 @@ redeploy:
 # Train voting units in parallel containers, assemble ensemble.
 train-parallel:
 	modal run modal_app.py::train_parallel
+
+# Incremental training: 3 corpus batches, model queryable after each batch.
+# The model improves in-place — no redeploy needed between batches.
+train-incremental:
+	modal run modal_app.py::train_incremental
 
 # Train N corpus shards in parallel, merge segments.
 train-shards:

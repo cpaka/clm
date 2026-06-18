@@ -49,7 +49,7 @@ class GenerateReq(BaseModel):
 # Version — bump to create a new independent deployment + isolated volume dir
 # ---------------------------------------------------------------------------
 
-VERSION = "v4.1"
+VERSION = "v4.3"
 
 # ---------------------------------------------------------------------------
 # Per-version configs
@@ -66,13 +66,13 @@ VERSION = "v4.1"
 
 CORPUS_CONFIG = {
     "name": "plain-text-wikipedia-simpleenglish (ffatty/plain-text-wikipedia-simpleenglish)",
-    "max_chars": 2_000_000,  # V4.0 baseline: ~1M chars → ~5K sentences
+    "max_chars": 8_000_000,  # V4.0 baseline: ~1M chars → ~5K sentences
     "vocab_size": 2000,      # cap vocabulary; rare words → <UNK> (bigram coverage ~5%)
 }
 
 TRAIN_CONFIG = {
     "epochs": 3,            # 3 passes — balanced speed/accuracy after batch-grow opt
-    "max_sequences": 10_000,  # ~8500 train / ~1500 test
+    "max_sequences": 40_000,  # ~8500 train / ~1500 test
     "test_fraction": 0.15,
     "replay_every": 2,      # hippocampal replay cadence (epochs)
 }
@@ -468,7 +468,7 @@ def warmup_cupy() -> dict:
         return {"status": "cupy_not_available", "seconds": 0}
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900, cpu=4)
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=3600, cpu=4)
 def train_unit(unit_id: int) -> dict:
     """Train ONE voting unit standalone and save it to unit_<id>.clm.
 
@@ -508,7 +508,7 @@ def train_unit(unit_id: int) -> dict:
     return {"unit": unit_id, "seconds": total, "vocab": m.stats()["vocab"]}
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=900)
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=4500)
 def train_parallel() -> dict:
     """Fan out unit training across containers, then assemble + save the ensemble."""
     import sys, time as _t
@@ -561,6 +561,146 @@ def train_parallel() -> dict:
                 message=f"Ensemble ready (parallel) — test top-1 {t1}%")
     print(f"[parallel] assembled {N} units in {total}s — test_top1={t1}% top3={t3}%")
     return {"units": N, "test_top1": t1, "test_top3": t3, "total_seconds": total}
+
+
+# ---------------------------------------------------------------------------
+# Incremental training — corpus split into batches, model queryable after each
+# ---------------------------------------------------------------------------
+
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=3600, cpu=4)
+def train_unit_batch(unit_id: int, batch_idx: int, n_batches: int) -> dict:
+    """Train one unit on one corpus batch.
+
+    Batch 0: fresh model, encoders fit on the full corpus (consistent vocab).
+    Batch 1+: warm-start from the previous checkpoint and continue training.
+    """
+    import sys, time as _t
+    sys.path.insert(0, "/root")
+    from pathlib import Path as P
+    from core.hierarchy import HierarchicalCLM
+    from persist.store import load_model, save_model
+
+    vol.reload()
+    all_train, _ = _load_split(TRAIN_CONFIG["test_fraction"])
+
+    # Deterministic slice for this batch
+    n = len(all_train)
+    batch_size = n // n_batches
+    start = batch_idx * batch_size
+    end = start + batch_size if batch_idx < n_batches - 1 else n
+    batch_seqs = all_train[start:end]
+    print(f"[unit {unit_id} b{batch_idx}] slice {start}:{end}  ({len(batch_seqs)} seqs)")
+
+    unit_path = str(VOL_PATH / f"unit_{unit_id}.clm")
+
+    t_enc = _t.time()
+    if batch_idx == 0 or not (P(unit_path) / "config.json").exists():
+        m = HierarchicalCLM(**_unit_cfg(unit_id))
+        m.fit_encoders(all_train)   # fit on full corpus → stable vocab across batches
+        print(f"[unit {unit_id} b{batch_idx}] encoder fit in {_t.time()-t_enc:.1f}s")
+    else:
+        m = load_model(unit_path)   # warm-start: column state carries over
+        print(f"[unit {unit_id} b{batch_idx}] warm-started in {_t.time()-t_enc:.1f}s  vocab={m.stats()['vocab']}")
+
+    t0 = _t.time()
+    m.train(batch_seqs, epochs=TRAIN_CONFIG["epochs"],
+            replay_every=TRAIN_CONFIG["replay_every"])
+    elapsed = round(_t.time() - t0, 1)
+    print(f"[unit {unit_id} b{batch_idx}] trained in {elapsed}s")
+
+    save_model(m, unit_path)
+    vol.commit()
+    return {"unit": unit_id, "batch": batch_idx, "seconds": elapsed,
+            "vocab": m.stats()["vocab"]}
+
+
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=3600 * 4)
+def train_incremental(n_batches: int = 3) -> list:
+    """Split corpus into n_batches and train sequentially.
+
+    After each batch all units are assembled into an ensemble and saved.
+    The webapp picks up the updated model on the next /predict or /generate
+    request (no redeploy needed) — so the model improves in place.
+
+    Usage:  modal run modal_app.py::train_incremental
+            modal run modal_app.py::train_incremental --n-batches 3
+    """
+    import sys, time as _t
+    sys.path.insert(0, "/root")
+    from core.hierarchy import HierarchicalCLM
+    from persist.store import load_model, save_model
+    from benchmarks.metrics import accuracy
+
+    N = MODEL_CONFIG["n_units"]
+
+    if not (VOL_PATH / "corpus.txt").exists():
+        _set_status(phase="error", message="corpus.txt not found — run fetch_corpus first")
+        return [{"error": "no corpus"}]
+
+    train_seq, test_seq = _load_split(TRAIN_CONFIG["test_fraction"])
+    results_all = []
+
+    for batch_idx in range(n_batches):
+        t0 = _t.time()
+        seqs_per_batch = len(train_seq) // n_batches
+        msg = f"batch {batch_idx+1}/{n_batches}  (~{seqs_per_batch} seqs/unit)"
+        print(f"[incremental] {msg}")
+        _set_status(phase="learning", message=f"Training {msg}…",
+                    progress=round(batch_idx / n_batches, 2))
+
+        # Fan out: all units train this batch in parallel
+        list(train_unit_batch.map(
+            range(N),
+            kwargs={"batch_idx": batch_idx, "n_batches": n_batches},
+        ))
+
+        # Assemble ensemble immediately — model becomes queryable now
+        vol.reload()
+        shell = HierarchicalCLM(n_units=N, seed_base=0, **{
+            k: v for k, v in _unit_cfg(0).items() if k not in ("n_units", "seed_base")
+        })
+        units = [load_model(str(VOL_PATH / f"unit_{i}.clm")).levels[0].units[0]
+                 for i in range(N)]
+        shell.inject_units(units)
+
+        t1, t3 = accuracy(shell, test_seq, max_probes=200)
+        tr1, _ = accuracy(shell, train_seq[:200], max_probes=200)
+        stats = shell.stats()
+        elapsed = round(_t.time() - t0, 1)
+
+        metrics = [{"epoch": batch_idx + 1, "test_top1": t1, "test_top3": t3,
+                    "train_top1": tr1, "burst_rate": 0.0,
+                    "segments": stats["segments_l0"], "neuromod": stats["neuromod"],
+                    "saturated": stats["saturated"]}]
+        shell.metrics = metrics
+        save_model(shell, str(VOL_PATH / MODEL_DIR_NAME))
+        (VOL_PATH / "metrics.json").write_text(json.dumps(metrics, indent=2))
+        vol.commit()
+
+        phase = "done" if batch_idx == n_batches - 1 else "ready"
+        _set_status(phase=phase, progress=round((batch_idx + 1) / n_batches, 2),
+                    metrics=metrics,
+                    message=f"Batch {batch_idx+1}/{n_batches} — top-1 {t1}%")
+        result = {"batch": batch_idx + 1, "n_batches": n_batches,
+                  "seconds": elapsed, "test_top1": t1, "test_top3": t3}
+        results_all.append(result)
+        print(f"[incremental] batch {batch_idx+1}/{n_batches} done in {elapsed}s "
+              f"— top1={t1}% top3={t3}% — model queryable")
+
+    _upsert_registry({
+        "version": VERSION,
+        "deployed_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "corpus_name": CORPUS_CONFIG["name"] + " (incremental)",
+        "epochs": TRAIN_CONFIG["epochs"],
+        "max_sequences": TRAIN_CONFIG["max_sequences"],
+        "test_top1": results_all[-1]["test_top1"],
+        "test_top3": results_all[-1]["test_top3"],
+        "vocab": stats["vocab"],
+        "train_sequences": len(train_seq),
+        "train_seconds": sum(r["seconds"] for r in results_all),
+    })
+    vol.commit()
+    return results_all
 
 
 # ---------------------------------------------------------------------------
@@ -1224,7 +1364,7 @@ class WebApp:
         async def predict(body: PredictReq):
             self._ensure_model()
             if not self.model:
-                return JSONResponse({"error": "Model not loaded"}, status_code=503)
+                return JSONResponse({"error": "Model not ready — training may still be in progress"}, status_code=503)
             preds = self.model.predict_next(body.tokens, topn=body.topn)
             return {"predictions": [[t, round(s, 4)] for t, s in preds]}
 
@@ -1232,14 +1372,44 @@ class WebApp:
         async def generate(body: GenerateReq):
             self._ensure_model()
             if not self.model:
-                return JSONResponse({"error": "Model not loaded"}, status_code=503)
+                return JSONResponse({"error": "Model not ready — training may still be in progress"}, status_code=503)
             return {"generated": self.model.generate(body.tokens, n=body.n)}
+
+        @api.get("/qa")
+        async def qa(question: str, n: int = 20):
+            """Answer factual questions by reformatting them as completion prompts.
+
+            Strategy: parse "what is X?" → prompt ["X", "is"] → generate.
+            Works for things the model saw in Wikipedia definitional sentences.
+            """
+            self._ensure_model()
+            if not self.model:
+                return JSONResponse({"error": "Model not ready — training may still be in progress"}, status_code=503)
+            import re
+            q = question.lower().strip().rstrip("?").strip()
+            words = re.split(r"\s+", q)
+            # Map common question forms → completion prompts
+            if len(words) >= 3 and words[:2] == ["what", "is"]:
+                prompt = words[2:] + ["is"]          # "what is a castle?" → ["a","castle","is"]
+            elif len(words) >= 3 and words[:2] == ["what", "are"]:
+                prompt = words[2:] + ["are"]         # "what are castles?" → ["castles","are"]
+            elif len(words) >= 3 and words[:2] == ["who", "is"]:
+                prompt = words[2:] + ["is"]
+            elif len(words) >= 2 and words[0] == "define":
+                prompt = words[1:] + ["is"]          # "define castle" → ["castle","is"]
+            elif len(words) >= 3 and words[:2] == ["how", "does"]:
+                prompt = words[2:] + ["works", "by"] # "how does X work?" → ["X","works","by"]
+            else:
+                prompt = words                        # fallback: use question as context
+            generated = self.model.generate(prompt, n=n)
+            return {"question": question, "prompt": prompt,
+                    "answer": " ".join(generated)}
 
         @api.get("/similar")
         async def similar(word: str, k: int = 6):
             self._ensure_model()
             if not self.model:
-                return JSONResponse({"error": "Model not loaded"}, status_code=503)
+                return JSONResponse({"error": "Model not ready — training may still be in progress"}, status_code=503)
             return {"word": word,
                     "neighbours": [[t, o] for t, o in self.model.similar(word, k=k)]}
 
@@ -1247,7 +1417,7 @@ class WebApp:
         async def fingerprint(word: str):
             self._ensure_model()
             if not self.model:
-                return JSONResponse({"error": "Model not loaded"}, status_code=503)
+                return JSONResponse({"error": "Model not ready — training may still be in progress"}, status_code=503)
             return self.model.fingerprint(word)
 
         @api.get("/stats")

@@ -1377,33 +1377,17 @@ class WebApp:
 
         @api.get("/qa")
         async def qa(question: str, n: int = 20):
-            """Answer factual questions by reformatting them as completion prompts.
+            """Semantic question answering via SDR fingerprints + intent detection.
 
-            Strategy: parse "what is X?" → prompt ["X", "is"] → generate.
-            Works for things the model saw in Wikipedia definitional sentences.
+            Fingerprints each query word, detects intent (definition/person/
+            process…), expands the subject via SDR similarity, scores candidate
+            completion prompts, and generates from the most confident one.
             """
             self._ensure_model()
             if not self.model:
                 return JSONResponse({"error": "Model not ready — training may still be in progress"}, status_code=503)
-            import re
-            q = question.lower().strip().rstrip("?").strip()
-            words = re.split(r"\s+", q)
-            # Map common question forms → completion prompts
-            if len(words) >= 3 and words[:2] == ["what", "is"]:
-                prompt = words[2:] + ["is"]          # "what is a castle?" → ["a","castle","is"]
-            elif len(words) >= 3 and words[:2] == ["what", "are"]:
-                prompt = words[2:] + ["are"]         # "what are castles?" → ["castles","are"]
-            elif len(words) >= 3 and words[:2] == ["who", "is"]:
-                prompt = words[2:] + ["is"]
-            elif len(words) >= 2 and words[0] == "define":
-                prompt = words[1:] + ["is"]          # "define castle" → ["castle","is"]
-            elif len(words) >= 3 and words[:2] == ["how", "does"]:
-                prompt = words[2:] + ["works", "by"] # "how does X work?" → ["X","works","by"]
-            else:
-                prompt = words                        # fallback: use question as context
-            generated = self.model.generate(prompt, n=n)
-            return {"question": question, "prompt": prompt,
-                    "answer": " ".join(generated)}
+            from core.qa import SemanticQA
+            return SemanticQA(self.model).answer(question, n=n)
 
         @api.get("/similar")
         async def similar(word: str, k: int = 6):

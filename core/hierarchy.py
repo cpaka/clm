@@ -234,6 +234,21 @@ class HierarchyLevel:
 
 # ── Hierarchical CLM ─────────────────────────────────────────────────────────
 
+def pick_novel(
+    preds: list[tuple[str, float]], out: list[str], window: int = 5
+) -> tuple[str, float]:
+    """Highest-ranked prediction not seen in the last `window` tokens of `out`.
+
+    Anti-loop heuristic shared by HierarchicalCLM.generate() and core.qa's
+    planned generator; falls back to the overall top-1 when every candidate
+    is recent (`preds` must be non-empty)."""
+    recent = set(out[-window:])
+    for t, s in preds:
+        if t not in recent:
+            return t, s
+    return preds[0]
+
+
 class HierarchicalCLM:
     """
     Multi-level cortical hierarchy with voting, k-WTA, neuromodulation
@@ -587,13 +602,14 @@ class HierarchicalCLM:
         return ranked[:topn]
 
     def generate(self, prompt: list[str], n: int = 8) -> list[str]:
-        """Greedy continuation for `n` tokens."""
+        """Greedy continuation for `n` tokens with recency-exclusion to prevent loops."""
         out = list(prompt)
         for _ in range(n):
-            pred = self.predict_next(out, topn=1)
-            if not pred:
+            # Extra candidates so pick_novel can skip recently used tokens
+            preds = self.predict_next(out, topn=6)
+            if not preds:
                 break
-            out.append(pred[0][0])
+            out.append(pick_novel(preds, out)[0])
         return out
 
     def similar(self, word: str, k: int = 6) -> list[tuple[str, int]]:

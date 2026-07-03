@@ -49,7 +49,8 @@ class GenerateReq(BaseModel):
 # Version — bump to create a new independent deployment + isolated volume dir
 # ---------------------------------------------------------------------------
 
-VERSION = "v4.3"
+VERSION      = "v5.0"
+PREV_VERSION = "v4.4"   # weights to inherit until v5.0 is retrained
 
 # ---------------------------------------------------------------------------
 # Per-version configs
@@ -71,7 +72,7 @@ CORPUS_CONFIG = {
 }
 
 TRAIN_CONFIG = {
-    "epochs": 3,            # 3 passes — balanced speed/accuracy after batch-grow opt
+    "epochs": 3,            # 3 passes — compression gives ~4× speedup so 3 is sufficient
     "max_sequences": 40_000,  # ~8500 train / ~1500 test
     "test_fraction": 0.15,
     "replay_every": 2,      # hippocampal replay cadence (epochs)
@@ -84,16 +85,16 @@ MODEL_CONFIG = {
     "strides": (1, 4),         # token level + phrase level
     "n_units": 3,              # voting columns per level
     "col_dim": 1024,           # SDR width / mini-column count
-    "cells_per_col": 8,        # temporal context depth
+    "cells_per_col": 4,        # compressed: 8→4 (2× faster overlap computation)
     "fp_bits": 21,             # active bits per fingerprint
     "index_bits": 7,           # identity-core bits
     "window": 4,               # wider co-occurrence → richer semantic fingerprints
     "kwta_k": 42,              # lateral inhibition: winners kept
     "replay_cap": 256,         # hippocampal buffer size
     "periods": (7, 11, 13, 17, 19, 23),
-    "activation_threshold": 8,
-    "syn_per_seg": 20,
-    "max_segs": 16,            # more segment capacity before saturation
+    "activation_threshold": 5, # compressed: 8→5 (keeps 40% ratio: 5/12 ≈ 8/20)
+    "syn_per_seg": 12,         # compressed: 20→12 (1.7× faster inner loop)
+    "max_segs": 8,             # compressed: 16→8 (2× faster segment scan)
 }
 
 # ---------------------------------------------------------------------------
@@ -1049,15 +1050,21 @@ CHAT_HTML = r"""<!DOCTYPE html>
   .msg.user { align-self: flex-end; background: #1d4ed8; color: #eff6ff; }
   .msg.bot { align-self: flex-start; background: #1e293b; border: 1px solid #334155; }
   .msg.bot .candidates { margin-top: 0.4rem; font-size: 0.8rem; color: #64748b; }
+  .msg.bot .qa-intent { display:inline-block; background:#1e40af; color:#bfdbfe; border-radius:9999px; padding:1px 9px; font-size:0.73rem; font-weight:700; letter-spacing:.04em; margin-bottom:0.35rem; }
+  .msg.bot .qa-answer { font-size:0.95rem; color:#e2e8f0; margin:0.2rem 0 0.3rem; }
+  .msg.bot .qa-meta { font-size:0.75rem; color:#475569; margin-top:0.3rem; }
+  .msg.bot .qa-related { display:flex; flex-wrap:wrap; gap:0.3rem; margin-top:0.4rem; }
+  .msg.bot .qa-related span { background:#0f172a; border:1px solid #334155; border-radius:9999px; padding:2px 9px; font-size:0.78rem; color:#94a3b8; cursor:pointer; }
+  .msg.bot .qa-related span:hover { border-color:#38bdf8; color:#e2e8f0; }
   #controls { display: flex; gap: 0.5rem; }
   input { padding: 0.6rem 0.9rem; background: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; color: #e2e8f0; font-size: 0.95rem; outline: none; }
   input:focus { border-color: #38bdf8; }
   #prompt, #wordA, #wordB { flex: 1; }
   button.act { padding: 0.6rem 1.1rem; border: none; border-radius: 0.75rem; cursor: pointer; font-size: 0.9rem; font-weight: 600; }
   button.act:hover { opacity: 0.85; }
-  #send-btn { background: #0ea5e9; color: #fff; }
-  #gen-btn  { background: #7c3aed; color: #fff; }
-  #fp-btn   { background: #0ea5e9; color: #fff; }
+  #send-btn    { background: #0ea5e9; color: #fff; }
+  #predict-btn { background: #7c3aed; color: #fff; }
+  #fp-btn      { background: #0ea5e9; color: #fff; }
 
   /* cards + charts */
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
@@ -1070,6 +1077,18 @@ CHAT_HTML = r"""<!DOCTYPE html>
   th { color: #475569; font-weight: 600; text-align: left; padding: 4px 8px; }
   td { padding: 4px 8px; color: #94a3b8; border-top: 1px solid #1e293b; }
   tr.current td { color: #e2e8f0; }
+
+  /* generate */
+  #gen-seed { flex: 1; }
+  #gen-output { background:#0b1220; border:1px solid #334155; border-radius:0.75rem; padding:1rem; min-height:80px; line-height:1.8; font-size:0.95rem; margin-top:1rem; white-space:pre-wrap; word-break:break-word; }
+  .gen-prompt { color:#94a3b8; }
+  .gen-word { color:#38bdf8; display:inline-block; padding:1px 4px; border-radius:4px; cursor:default; }
+  .gen-word:hover { background:#1e293b; }
+  .gen-controls { display:flex; align-items:center; gap:0.75rem; flex-wrap:wrap; margin-bottom:0.75rem; }
+  .gen-controls label { font-size:0.82rem; color:#64748b; }
+  .gen-controls input[type=range] { accent-color:#38bdf8; }
+  #gen-btn { background:#0ea5e9; color:#fff; }
+  #gen-clear { background:#334155; color:#94a3b8; font-size:0.85rem; }
 
   /* explore / fingerprint */
   .exrow { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
@@ -1088,6 +1107,7 @@ CHAT_HTML = r"""<!DOCTYPE html>
   <span id="ver"></span>
   <nav>
     <button data-view="chat" class="active">Chat</button>
+    <button data-view="generate">Generate</button>
     <button data-view="dash">Dashboard</button>
     <button data-view="explore">Explore</button>
     <a href="/docs" target="_blank" style="color:#94a3b8;text-decoration:none;padding:0.4rem 0.9rem;border-radius:0.6rem;font-size:0.85rem;font-weight:600;" onmouseover="this.style.background='#334155'" onmouseout="this.style.background=''">Docs ↗</a>
@@ -1099,10 +1119,23 @@ CHAT_HTML = r"""<!DOCTYPE html>
   <section id="chat" class="view active">
     <div id="messages"></div>
     <div id="controls">
-      <input id="prompt" placeholder="Type a phrase&hellip;" autocomplete="off"/>
-      <button class="act" id="send-btn">Predict</button>
-      <button class="act" id="gen-btn">Generate</button>
+      <input id="prompt" placeholder="Ask a question or type a phrase&hellip;" autocomplete="off"/>
+      <button class="act" id="send-btn">Send</button>
+      <button class="act" id="predict-btn">Predict</button>
     </div>
+  </section>
+
+  <!-- GENERATE -->
+  <section id="generate" class="view">
+    <p class="muted">Type a seed phrase — the model continues it token by token. Generated words are shown in blue. Hover a word to see its position.</p>
+    <div class="gen-controls">
+      <input id="gen-seed" placeholder="Seed phrase (e.g. &quot;a castle is&quot;)" autocomplete="off"/>
+      <label>tokens <b id="gen-n-val">20</b><br/><input id="gen-n" type="range" min="5" max="60" value="20" oninput="$('gen-n-val').textContent=this.value"/></label>
+      <button class="act" id="gen-btn">Generate</button>
+      <button class="act" id="gen-clear">Clear</button>
+    </div>
+    <div id="gen-output"><span class="muted">Output will appear here…</span></div>
+    <div id="gen-stats" class="muted" style="margin-top:0.5rem;font-size:0.8rem;"></div>
   </section>
 
   <!-- DASHBOARD -->
@@ -1157,12 +1190,68 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
 
 /* ---- chat ---- */
 const messages = $('messages'), promptEl = $('prompt');
+const Q_RE = /^(what|who|where|when|why|how|which|explain|define|describe)\b|\?/i;
+
 function addMsg(role, text, sub) {
   const el = document.createElement('div'); el.className = 'msg ' + role; el.textContent = text;
   if (sub) { const s = document.createElement('div'); s.className = 'candidates'; s.textContent = sub; el.appendChild(s); }
   messages.appendChild(el); messages.scrollTop = messages.scrollHeight;
 }
+
+function addQAMsg(d) {
+  const el = document.createElement('div'); el.className = 'msg bot';
+
+  const badge = document.createElement('div'); badge.className = 'qa-intent';
+  badge.textContent = d.intent || 'continuation';
+  el.appendChild(badge);
+
+  const ans = document.createElement('div'); ans.className = 'qa-answer';
+  ans.textContent = d.answer || '(no answer generated)';
+  el.appendChild(ans);
+
+  if (d.related?.length) {
+    const rel = document.createElement('div'); rel.className = 'qa-related';
+    d.related.forEach(w => {
+      const s = document.createElement('span'); s.textContent = w;
+      s.onclick = () => { promptEl.value = 'what is ' + w + '?'; $('send-btn').click(); };
+      rel.appendChild(s);
+    });
+    el.appendChild(rel);
+  }
+
+  const meta = document.createElement('div'); meta.className = 'qa-meta';
+  const promptStr = d.prompt ? '"' + d.prompt.join(' ') + '"' : '';
+  meta.textContent = [
+    d.confidence !== undefined ? 'confidence: ' + d.confidence : '',
+    promptStr ? 'prompt: ' + promptStr : ''
+  ].filter(Boolean).join(' · ');
+  if (meta.textContent) el.appendChild(meta);
+
+  messages.appendChild(el); messages.scrollTop = messages.scrollHeight;
+}
+
+/* Send — smart route: question → /qa, else → /generate */
 $('send-btn').onclick = async () => {
+  const t = promptEl.value.trim(); if (!t) return;
+  addMsg('user', t); promptEl.value = '';
+
+  if (Q_RE.test(t)) {
+    try {
+      const r = await fetch('/qa?' + new URLSearchParams({question: t}));
+      const d = await r.json();
+      if (d.error) { addMsg('bot', '⚠ ' + d.error); return; }
+      addQAMsg(d);
+    } catch(e) { addMsg('bot', 'Error: ' + e.message); }
+  } else {
+    try {
+      const r = await fetch('/generate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({tokens: t.toLowerCase().split(/\s+/), n: 20})});
+      const d = await r.json(); addMsg('bot', d.generated ? d.generated.join(' ') : '(no output)');
+    } catch(e) { addMsg('bot', 'Error: ' + e.message); }
+  }
+};
+
+/* Predict — raw HTM next-word debug */
+$('predict-btn').onclick = async () => {
   const t = promptEl.value.trim(); if (!t) return; addMsg('user', t); promptEl.value = '';
   try {
     const r = await fetch('/predict', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({tokens: t.toLowerCase().split(/\s+/), topn: 5})});
@@ -1171,13 +1260,7 @@ $('send-btn').onclick = async () => {
     else addMsg('bot','(no prediction)');
   } catch(e) { addMsg('bot','Error: '+e.message); }
 };
-$('gen-btn').onclick = async () => {
-  const t = promptEl.value.trim(); if (!t) return; addMsg('user','[generate] '+t); promptEl.value = '';
-  try {
-    const r = await fetch('/generate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({tokens: t.toLowerCase().split(/\s+/), n: 15})});
-    const d = await r.json(); addMsg('bot', d.generated ? d.generated.join(' ') : '(no output)');
-  } catch(e) { addMsg('bot','Error: '+e.message); }
-};
+
 promptEl.addEventListener('keydown', e => { if (e.key==='Enter') { e.preventDefault(); $('send-btn').click(); } });
 
 /* ---- header status (poll) ---- */
@@ -1259,6 +1342,54 @@ $('train-btn').onclick = async () => {
   pollStatus();
 };
 
+/* ---- sentence generator ---- */
+$('gen-btn').onclick = async () => {
+  const seed = $('gen-seed').value.trim();
+  const n = parseInt($('gen-n').value);
+  const out = $('gen-output');
+  const stats = $('gen-stats');
+  out.innerHTML = '<span class="muted">Generating…</span>';
+  stats.textContent = '';
+  try {
+    const tokens = seed ? seed.toLowerCase().split(/\s+/) : [];
+    const t0 = performance.now();
+    const r = await fetch('/generate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({tokens, n})
+    });
+    const d = await r.json();
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+    if (d.error) { out.innerHTML = '<span style="color:#f87171">' + d.error + '</span>'; return; }
+    const generated = d.generated || [];
+    const genWords = generated.slice(tokens.length);
+    out.innerHTML = '';
+    // Prompt words in grey
+    tokens.forEach((w, i) => {
+      const sp = document.createElement('span');
+      sp.className = 'gen-prompt';
+      sp.title = 'prompt[' + i + ']';
+      sp.textContent = w + ' ';
+      out.appendChild(sp);
+    });
+    // Generated words in blue, with position on hover
+    genWords.forEach((w, i) => {
+      const sp = document.createElement('span');
+      sp.className = 'gen-word';
+      sp.title = 'step ' + (i + 1);
+      sp.textContent = w + ' ';
+      out.appendChild(sp);
+    });
+    stats.textContent = genWords.length + ' tokens generated in ' + elapsed + 's';
+  } catch(e) { out.innerHTML = '<span style="color:#f87171">Error: ' + e.message + '</span>'; }
+};
+$('gen-clear').onclick = () => {
+  $('gen-output').innerHTML = '<span class="muted">Output will appear here…</span>';
+  $('gen-stats').textContent = '';
+  $('gen-seed').value = '';
+};
+$('gen-seed').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); $('gen-btn').click(); } });
+
 /* ---- explore: fingerprint visualisation ---- */
 async function fp(word) {
   const r = await fetch('/fingerprint?word=' + encodeURIComponent(word));
@@ -1323,18 +1454,33 @@ class WebApp:
 
     def _load_model(self, refresh: bool = False):
         """(Re)load model + metrics from the Volume. `refresh` re-syncs the
-        Volume first so a model trained in another container becomes visible."""
+        Volume first so a model trained in another container becomes visible.
+
+        Falls back to PREV_VERSION weights when no checkpoint exists for the
+        current VERSION yet (e.g. UI-only bumps that don't retrain)."""
         from persist.store import load_model
         if refresh:
             vol.reload()
         model_dir = VOL_PATH / MODEL_DIR_NAME
+        self._fallback_active = False
+        # Fall back to previous version's checkpoint if this version has none yet
+        if not (model_dir / "config.json").exists() and PREV_VERSION:
+            prev_dir = Path(_VOL_MOUNT) / PREV_VERSION / MODEL_DIR_NAME
+            if (prev_dir / "config.json").exists():
+                model_dir = prev_dir
+                self._fallback_active = True
+                print(f"[{VERSION}] No checkpoint yet — loading from {PREV_VERSION}")
         if (model_dir / "config.json").exists():
             try:
                 self.model = load_model(str(model_dir))
-                print(f"[{VERSION}] Model loaded.")
+                print(f"[{VERSION}] Model loaded from {model_dir}")
             except Exception as e:
                 print(f"[{VERSION}] Could not load model: {e}")
         metrics_path = VOL_PATH / "metrics.json"
+        # Inherit metrics only together with the weights, so the model and its
+        # accuracy history always describe the same checkpoint
+        if not metrics_path.exists() and self._fallback_active:
+            metrics_path = Path(_VOL_MOUNT) / PREV_VERSION / "metrics.json"
         if metrics_path.exists():
             self.metrics = json.loads(metrics_path.read_text())
 
@@ -1343,6 +1489,18 @@ class WebApp:
         started — so a fresh `make deploy` needs no manual /reload."""
         if self.model is None:
             self._load_model(refresh=True)
+            return
+        # While serving inherited PREV_VERSION weights, keep checking
+        # (throttled) for this version's own checkpoint so a headless retrain
+        # is picked up without a manual /reload
+        if getattr(self, "_fallback_active", False):
+            now = time.time()
+            if now - getattr(self, "_fallback_checked", 0.0) < 30:
+                return
+            self._fallback_checked = now
+            vol.reload()
+            if (VOL_PATH / MODEL_DIR_NAME / "config.json").exists():
+                self._load_model()
 
     @modal.asgi_app()
     def serve(self):
@@ -1376,18 +1534,17 @@ class WebApp:
             return {"generated": self.model.generate(body.tokens, n=body.n)}
 
         @api.get("/qa")
-        async def qa(question: str, n: int = 20):
-            """Semantic question answering via SDR fingerprints + intent detection.
-
-            Fingerprints each query word, detects intent (definition/person/
-            process…), expands the subject via SDR similarity, scores candidate
-            completion prompts, and generates from the most confident one.
+        async def qa(question: str):
+            """Semantic question answering: multi-level prompt encoding, intent
+            detection, SDR-similarity expansion, confidence-scored prompt
+            selection, and planned generation with adaptive stopping (the
+            response length is decided by the ResponsePlanner, not the caller).
             """
             self._ensure_model()
             if not self.model:
                 return JSONResponse({"error": "Model not ready — training may still be in progress"}, status_code=503)
             from core.qa import SemanticQA
-            return SemanticQA(self.model).answer(question, n=n)
+            return SemanticQA(self.model).answer(question)
 
         @api.get("/similar")
         async def similar(word: str, k: int = 6):

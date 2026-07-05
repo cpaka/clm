@@ -190,6 +190,7 @@ def load_model(path: str) -> HierarchicalCLM:
                 unit.col.seg_idx = data["seg_idx"]
                 unit.col.seg_perm = data["seg_perm"]
                 unit.col.n_segs = data["n_segs"]
+                unit.col._index_valid = False       # rebuild presynaptic index on next punish
 
             # Spatial Pooler weights (created by __init__ when use_spatial_pooler)
             sp_file = root / f"sp_{tag}.npz"

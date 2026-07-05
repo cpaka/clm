@@ -1486,6 +1486,7 @@ class WebApp:
         if (model_dir / "config.json").exists():
             try:
                 self.model = load_model(str(model_dir))
+                self._reason_space = None      # invalidate grounded space on reload
                 print(f"[{VERSION}] Model loaded from {model_dir}")
             except Exception as e:
                 print(f"[{VERSION}] Could not load model: {e}")
@@ -1496,6 +1497,15 @@ class WebApp:
             metrics_path = Path(_VOL_MOUNT) / PREV_VERSION / "metrics.json"
         if metrics_path.exists():
             self.metrics = json.loads(metrics_path.read_text())
+
+    def _ensure_reason_space(self):
+        """Build (once, cached) a ConceptSpace grounded in the live model's
+        learned representations — coordinates discovered from the corpus the
+        model was trained on.  Invalidated whenever the model reloads."""
+        if getattr(self, "_reason_space", None) is None:
+            from core.reasoning import ground_model
+            self._reason_space = ground_model(self.model, n_axes=8)
+        return self._reason_space
 
     def _ensure_model(self):
         """Lazily pick up a model trained after this (always-on) container
@@ -1573,6 +1583,57 @@ class WebApp:
             if not self.model:
                 return JSONResponse({"error": "Model not ready — training may still be in progress"}, status_code=503)
             return self.model.fingerprint(word)
+
+        @api.get("/reason")
+        async def reason(mode: str = "analogy", a: str = "", b: str = "",
+                         c: str = "", word: str = "", k: int = 6):
+            """Reasoning over a knowledge space grounded in the model's learned
+            (Spatial-Pooler) representations.
+
+              /reason?mode=analogy&a=king&b=queen&c=man   → a:b :: c:?
+              /reason?mode=neighbors&word=paris&k=6        → nearest concepts
+            """
+            import numpy as _np
+            self._ensure_model()
+            if not self.model:
+                return JSONResponse({"error": "Model not ready — training may still be in progress"}, status_code=503)
+            try:
+                space = self._ensure_reason_space()
+            except Exception as e:
+                return JSONResponse({"error": f"could not build reasoning space: {e}"}, status_code=500)
+
+            def norm(w):
+                return (w or "").strip().lower()
+
+            def nearest(target, exclude, n):
+                return sorted(
+                    ((name, int(_np.abs(space.coord[name] - target).sum()))
+                     for name in space.coord if name not in exclude),
+                    key=lambda kv: kv[1])[:n]
+
+            if mode == "analogy":
+                a, b, c = norm(a), norm(b), norm(c)
+                if not (a and b and c):
+                    return JSONResponse({"error": "analogy needs a, b, c (a:b :: c:?)"}, status_code=400)
+                missing = [x for x in (a, b, c) if x not in space.coord]
+                if missing:
+                    return JSONResponse({"error": f"unknown word(s): {', '.join(missing)}"}, status_code=400)
+                from core.reasoning import analogy as _analogy
+                target = space.coord[b] - space.coord[a] + space.coord[c]
+                return {"mode": "analogy", "a": a, "b": b, "c": c,
+                        "answer": _analogy(space, a, b, c),
+                        "nearest": [[n, d] for n, d in nearest(target, {a, b, c}, k)]}
+
+            if mode == "neighbors":
+                word = norm(word)
+                if not word:
+                    return JSONResponse({"error": "neighbors needs word"}, status_code=400)
+                if word not in space.coord:
+                    return JSONResponse({"error": f"unknown word: {word}"}, status_code=400)
+                return {"mode": "neighbors", "word": word,
+                        "neighbours": [[n, d] for n, d in nearest(space.coord[word], {word}, k)]}
+
+            return JSONResponse({"error": f"unknown mode '{mode}' (analogy|neighbors)"}, status_code=400)
 
         @api.get("/stats")
         async def stats():

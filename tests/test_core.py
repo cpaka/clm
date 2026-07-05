@@ -237,6 +237,29 @@ def test_semantic_encoder_update():
     assert new_count >= 1
 
 
+def test_fast_punish_matches_bruteforce():
+    """The index-scoped predicted-inactive punishment must be identical to the
+    full-scan reference — same trained synaptic state, bit for bit."""
+    seqs = [["the", "cat", "sat", "on", "mat"],
+            ["a", "dog", "ran", "in", "park"],
+            ["the", "sun", "rose", "at", "dawn"]] * 12
+
+    def train(fast: bool):
+        m = HierarchicalCLM(n_levels=1, strides=(1,), n_units=1, col_dim=256,
+                            cells_per_col=4, encoder="semantic", dim=256,
+                            fp_bits=21, index_bits=7, activation_threshold=5,
+                            syn_per_seg=12, max_segs=8)
+        m.fit_encoders(seqs)
+        m._build()
+        m.levels[0].units[0].col._fast_punish = fast
+        m.train(seqs, epochs=4)
+        return np.asarray(m.levels[0].units[0].col.seg_perm)
+
+    fast, brute = train(True), train(False)
+    assert fast.shape == brute.shape
+    assert np.array_equal(fast, brute), "fast punishment diverged from full scan"
+
+
 # ── Manual runner ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

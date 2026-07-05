@@ -30,6 +30,7 @@ Source index space
   cells (a shrinking minority as the model learns).
 """
 from __future__ import annotations
+from collections import defaultdict
 import numpy as _np
 
 from .xp import xp, _GPU, asnumpy
@@ -107,6 +108,20 @@ class CorticalColumn:
         self.last_winners = xp.zeros(self.n_cells, dtype=xp.bool_)
         self.last_bursts = 0           # surprised columns in the last step
         self.last_active_cols = 0      # active columns in the last step
+
+        # Presynaptic index: winner-cell source → set of flat segment ids
+        # (cell*max_segs+seg) that have a potential synapse onto it.  Lets the
+        # predicted-inactive punishment scan only the segments that could
+        # possibly be predictive given the current winners, instead of every
+        # segmented cell.  Maintained on grow/recycle (structure changes only —
+        # permanence adaptation never moves a synapse's source).
+        self._seg_src: dict[int, set[int]] = defaultdict(set)
+        self._index_valid = True
+        # Index-scoped punishment is opt-in: it is O(candidate segments) and helps
+        # when winners are selective (structured language), but on dense/uniform
+        # activity the candidate set approaches every segment and Python-set
+        # collection loses to the vectorised full scan.  Default = safe full scan.
+        self._fast_punish = False
 
     # ── Backend migration ────────────────────────────────────────────────────
 
@@ -227,16 +242,56 @@ class CorticalColumn:
             self.seg_perm[cells, segs] + delta, 0.0, 1.0
         )
 
+    # ── Presynaptic index maintenance ──────────────────────────────────────
+
+    def _index_add(self, cell: int, si: int, sources) -> None:
+        """Register cell-source synapses of segment (cell, si) in the index."""
+        flat = cell * self.max_segs + si
+        for s in _np.asarray(sources):
+            if int(s) < self.n_cells:
+                self._seg_src[int(s)].add(flat)
+
+    def _index_remove(self, cell: int, si: int) -> None:
+        """Deregister the current synapses of (cell, si) before it is overwritten."""
+        flat = cell * self.max_segs + si
+        row = asnumpy(self.seg_idx[cell, si])
+        for s in row[row < self.n_cells]:
+            self._seg_src[int(s)].discard(flat)
+
+    def _rebuild_index(self) -> None:
+        """Rebuild the presynaptic index from scratch (after load / merge)."""
+        self._seg_src = defaultdict(set)
+        n_segs = asnumpy(self.n_segs)
+        idx = asnumpy(self.seg_idx)
+        for cell in _np.where(n_segs > 0)[0]:
+            for si in range(int(n_segs[cell])):
+                self._index_add(int(cell), si, idx[cell, si])
+        self._index_valid = True
+
     def _punish_false_predictions(
         self, src: xp.ndarray, feature_sdr: xp.ndarray
     ) -> None:
-        """Decrement active synapses on segments that were predictive for a
-        column which did not become active (HTM predicted-inactive punishment,
-        rate = pred_dec)."""
+        """Punish predicted-inactive segments — fast (index-scoped) by default,
+        with a full-scan fallback that produces an identical result."""
+        if self._fast_punish:
+            self._punish_fast(src, feature_sdr)
+        else:
+            self._punish_brute(src, feature_sdr)
+
+    def _punish_brute(self, src: xp.ndarray, feature_sdr: xp.ndarray) -> None:
+        """Vectorised full-scan punishment over every segmented cell.
+
+        Connected-overlap only — the potential overlap that `_compute_overlaps_
+        scoped` also produces is unused here, so it is skipped (fewer big
+        allocations / reductions per step)."""
         cells = xp.where(self.n_segs > 0)[0]
         if cells.size == 0:
             return
-        conn_c, _, valid_c = self._compute_overlaps_scoped(src, cells)
+        idx = self.seg_idx[cells]                         # (N, max_segs, syn_per_seg)
+        conn_c = ((src[idx]) & (self.seg_perm[cells] >= self.connected)
+                  & (idx < self.source_dim)).sum(axis=-1)
+        seg_range = xp.arange(self.max_segs, dtype=xp.int32)
+        valid_c = seg_range[None, :] < self.n_segs[cells][:, None]
         pred_mask = (conn_c >= self.activation_threshold) & valid_c
         if not pred_mask.any():
             return
@@ -246,9 +301,49 @@ class CorticalColumn:
         col_active[feature_sdr] = True
         wrong = ~col_active[pred_cells // self.cpc]
         if wrong.any():
-            # _batch_adapt with inc=-pred_dec, dec=0: active synapses are
-            # decremented, inactive ones untouched.
             self._batch_adapt(pred_cells[wrong].astype(xp.int64), si[wrong],
+                              src, -self.pred_dec, 0.0)
+
+    def _punish_fast(
+        self, src: xp.ndarray, feature_sdr: xp.ndarray
+    ) -> None:
+        """Decrement active synapses on segments that were predictive for a
+        column which did not become active (HTM predicted-inactive punishment,
+        rate = pred_dec).
+
+        Scans only the segments the presynaptic index says connect to the current
+        winner cells — a complete superset of the predictive segments, because a
+        predictive segment needs `activation_threshold` connected synapses and at
+        most `loc_syn_cap` (< threshold) may be location bits, so it always has a
+        cell synapse onto an active winner.  Result is identical to a full scan."""
+        if not self._index_valid:
+            self._rebuild_index()
+        active_cells = _np.where(asnumpy(src[: self.n_cells]))[0]
+        if active_cells.size == 0:
+            return
+        cand: set[int] = set()
+        for c in active_cells:
+            s = self._seg_src.get(int(c))
+            if s:
+                cand.update(s)
+        if not cand:
+            return
+
+        flats = _np.fromiter(cand, dtype=_np.int64, count=len(cand))
+        cells = xp.asarray(flats // self.max_segs)
+        segs = xp.asarray(flats % self.max_segs)
+        idx = self.seg_idx[cells, segs]                       # (K, syn_per_seg)
+        conn = ((src[idx]) & (self.seg_perm[cells, segs] >= self.connected)
+                & (idx < self.source_dim)).sum(axis=-1)
+        pred = conn >= self.activation_threshold
+        if not bool(pred.any()):
+            return
+        col_active = xp.zeros(self.col_dim, dtype=xp.bool_)
+        col_active[feature_sdr] = True
+        wrong = pred & (~col_active[cells // self.cpc])
+        if bool(wrong.any()):
+            # _batch_adapt with inc=-pred_dec, dec=0: active synapses decremented.
+            self._batch_adapt(cells[wrong].astype(xp.int64), segs[wrong],
                               src, -self.pred_dec, 0.0)
 
     # ── Learning helpers (CPU-side; grow ops are rare and small) ────────────
@@ -277,6 +372,7 @@ class CorticalColumn:
         if empty.size:
             self.seg_idx[cell, si, empty] = xp.asarray(new_idx[: empty.size])
             self.seg_perm[cell, si, empty] = self.init_perm
+            self._index_add(cell, si, new_idx[: empty.size])
 
     def _grow_seg(self, cell: int, active_src_cpu: _np.ndarray) -> None:
         """Allocate a new segment on `cell` from CPU active source indices.
@@ -291,6 +387,7 @@ class CorticalColumn:
         if n_segs_now >= self.max_segs:
             perm_cpu = asnumpy(self.seg_perm[cell])
             si = int(perm_cpu.sum(axis=-1).argmin())
+            self._index_remove(cell, si)             # drop the recycled segment
             self.seg_idx[cell, si] = self.source_dim
             self.seg_perm[cell, si] = 0.0
         else:
@@ -299,6 +396,7 @@ class CorticalColumn:
         chosen = self._choose_syn(active_src_cpu, self.syn_per_seg)
         self.seg_idx[cell, si, : len(chosen)] = xp.asarray(chosen)
         self.seg_perm[cell, si, : len(chosen)] = self.init_perm
+        self._index_add(cell, si, chosen)
 
     def _choose_syn(self, active_src_cpu: _np.ndarray, k: int) -> _np.ndarray:
         """Pick up to `k` synapse sources, capping location bits at loc_syn_cap.

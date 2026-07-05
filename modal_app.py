@@ -49,8 +49,8 @@ class GenerateReq(BaseModel):
 # Version — bump to create a new independent deployment + isolated volume dir
 # ---------------------------------------------------------------------------
 
-VERSION      = "v5.0"
-PREV_VERSION = "v4.4"   # weights to inherit until v5.0 is retrained
+VERSION      = "v5.1"
+PREV_VERSION = "v5.0"   # weights to inherit until v5.1 is retrained
 
 # ---------------------------------------------------------------------------
 # Per-version configs
@@ -84,7 +84,7 @@ MODEL_CONFIG = {
     "n_levels": 2,
     "strides": (1, 4),         # token level + phrase level
     "n_units": 3,              # voting columns per level
-    "col_dim": 1024,           # SDR width / mini-column count
+    "col_dim": 2048,           # v5.1: 1024→2048 — 2× representation capacity
     "cells_per_col": 4,        # compressed: 8→4 (2× faster overlap computation)
     "fp_bits": 21,             # active bits per fingerprint
     "index_bits": 7,           # identity-core bits
@@ -473,7 +473,7 @@ def warmup_cupy() -> dict:
         return {"status": "cupy_not_available", "seconds": 0}
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=7200, cpu=4)
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=21600, cpu=4)
 def train_unit(unit_id: int) -> dict:
     """Train ONE voting unit standalone and save it to unit_<id>.clm.
 
@@ -513,7 +513,7 @@ def train_unit(unit_id: int) -> dict:
     return {"unit": unit_id, "seconds": total, "vocab": m.stats()["vocab"]}
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=9000)
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=28800)
 def train_parallel() -> dict:
     """Fan out unit training across containers, then assemble + save the ensemble."""
     import sys, time as _t

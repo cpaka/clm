@@ -5,6 +5,27 @@
 > experiment. Intended as the starting point for building the reasoning layer of
 > the CLM on top of the cortical-column core.
 
+## Status: first slice IMPLEMENTED ✅
+
+The VSA algebra, grid reference frames, and the first reasoning tasks are built
+and passing their falsifiable milestone tests (§6):
+
+| Module | Contents |
+|---|---|
+| `core/vsa.py` | bind / unbind / bundle / permute / similarity, `RoleBook`, `Codebook` (cleanup) |
+| `core/displacement.py` | `GridSpace` (N-axis grid), `Relation` (learned displacement, compose) |
+| `core/reasoning.py` | `ConceptSpace`, `walk` / `infer_relation` (transitive), `analogy`, `SentenceSpace` (SVO) |
+| `tests/test_reasoning.py` | 8 tests: bind/unbind, transitive generalisation, analogy, VSA-beats-raw-union |
+
+Run: `python -m tests.test_reasoning` (8/8 passing). Verified milestones:
+transitive inference generalises to **unseen** distances from adjacent-only
+training; `man:king :: woman:queen` by displacement transfer; and VSA keeps
+"cat chased mouse" ≠ "mouse chased cat" where raw SDR union collapses them.
+
+**Next (not yet built):** the active-inference *walk with value/goal steering*
+over learned relations (beam search + `NeuromodSignal` reward), and scaling from
+toy concept spaces + SVO triples toward dependency-parsed language.
+
 ---
 
 ## 1. The hypothesis

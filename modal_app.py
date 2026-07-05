@@ -96,6 +96,9 @@ MODEL_CONFIG = {
     "syn_per_seg": 12,         # compressed: 20→12 (1.7× faster inner loop)
     "max_segs": 8,             # compressed: 16→8 (2× faster segment scan)
     "use_spatial_pooler": True,  # learn SDR representations (fit once, frozen, cached)
+    # KEEP: A/B on real corpus — punishment ~doubles held-out top-1 (7.3% vs 4.0%)
+    # for ~2.4× train time. Do not drop for speed; it prevents predictive bloat.
+    "pred_dec": 0.01,
 }
 
 # ---------------------------------------------------------------------------

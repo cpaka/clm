@@ -87,6 +87,10 @@ def save_model(model: HierarchicalCLM, path: str) -> None:
                 n_segs=unit.col.n_segs,
             )
 
+            # Spatial Pooler weights (learned representations), if present
+            if getattr(unit, "sp", None) is not None:
+                np.savez_compressed(root / f"sp_{tag}.npz", **unit.sp.state())
+
             # Token SDR map + inverted index
             if unit._token_sdr:
                 tokens = list(unit._token_sdr.keys())
@@ -147,6 +151,8 @@ def load_model(path: str) -> HierarchicalCLM:
 
     col_kwargs = dict(cfg["col_kwargs"])
     col_kwargs["periods"] = tuple(col_kwargs["periods"])
+    if col_kwargs.get("loc_periods"):
+        col_kwargs["loc_periods"] = tuple(col_kwargs["loc_periods"])
 
     seed_base = cfg.get("seed_base", 0)
     model = HierarchicalCLM(
@@ -185,6 +191,12 @@ def load_model(path: str) -> HierarchicalCLM:
                 unit.col.seg_perm = data["seg_perm"]
                 unit.col.n_segs = data["n_segs"]
 
+            # Spatial Pooler weights (created by __init__ when use_spatial_pooler)
+            sp_file = root / f"sp_{tag}.npz"
+            if sp_file.exists() and getattr(unit, "sp", None) is not None:
+                d = np.load(sp_file)
+                unit.sp.load_state(d["syn_idx"], d["syn_perm"], d["active_duty"])
+
             # Token SDR map + inverted index
             tsdr_file = root / f"token_sdr_{tag}.npz"
             if tsdr_file.exists():
@@ -220,5 +232,9 @@ def load_model(path: str) -> HierarchicalCLM:
         data = np.load(replay_file, allow_pickle=True)
         for seq_str, br in zip(data["sequences"].tolist(), data["burst_rates"].tolist()):
             model.replay._buf.append((seq_str.split(" "), float(br)))
+
+    # SP weights were restored above; mark fitted so re-training won't refit.
+    if model.use_spatial_pooler:
+        model._poolers_fit = True
 
     return model

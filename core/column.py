@@ -70,12 +70,17 @@ class CorticalColumn:
         min_threshold: int = 5,
         syn_per_seg: int = 24,
         max_segs: int = 32,
+        loc_syn_cap: int | None = 3,
     ):
         self.col_dim = col_dim
         self.cpc = cells_per_col
         self.n_cells = col_dim * cells_per_col
         self.loc_dim = loc_dim
         self.source_dim = self.n_cells + loc_dim    # sentinel = source_dim
+        # Cap on location-derived synapses per segment: location bits are a soft
+        # contextual cue, so a segment must still be driven mostly by cell
+        # (token-context) sources and never activate on location alone.
+        self.loc_syn_cap = loc_syn_cap
 
         self.connected = connected
         self.init_perm = init_perm
@@ -222,6 +227,30 @@ class CorticalColumn:
             self.seg_perm[cells, segs] + delta, 0.0, 1.0
         )
 
+    def _punish_false_predictions(
+        self, src: xp.ndarray, feature_sdr: xp.ndarray
+    ) -> None:
+        """Decrement active synapses on segments that were predictive for a
+        column which did not become active (HTM predicted-inactive punishment,
+        rate = pred_dec)."""
+        cells = xp.where(self.n_segs > 0)[0]
+        if cells.size == 0:
+            return
+        conn_c, _, valid_c = self._compute_overlaps_scoped(src, cells)
+        pred_mask = (conn_c >= self.activation_threshold) & valid_c
+        if not pred_mask.any():
+            return
+        ci, si = xp.where(pred_mask)
+        pred_cells = cells[ci]
+        col_active = xp.zeros(self.col_dim, dtype=xp.bool_)
+        col_active[feature_sdr] = True
+        wrong = ~col_active[pred_cells // self.cpc]
+        if wrong.any():
+            # _batch_adapt with inc=-pred_dec, dec=0: active synapses are
+            # decremented, inactive ones untouched.
+            self._batch_adapt(pred_cells[wrong].astype(xp.int64), si[wrong],
+                              src, -self.pred_dec, 0.0)
+
     # ── Learning helpers (CPU-side; grow ops are rare and small) ────────────
 
     def _grow_syn(
@@ -250,17 +279,43 @@ class CorticalColumn:
             self.seg_perm[cell, si, empty] = self.init_perm
 
     def _grow_seg(self, cell: int, active_src_cpu: _np.ndarray) -> None:
-        """Allocate a new segment on `cell` from CPU active source indices."""
+        """Allocate a new segment on `cell` from CPU active source indices.
+
+        A segment with zero synapses is useless, so an empty source is a no-op
+        rather than a wasted slot.  When the cell is at max_segs the weakest
+        segment (lowest total permanence) is recycled — learning never
+        silently stops on saturated cells."""
+        if not active_src_cpu.size:
+            return
         n_segs_now = int(self.n_segs[cell])
         if n_segs_now >= self.max_segs:
-            return
-        si = n_segs_now
-        candidates = active_src_cpu.copy()
-        self.rng.shuffle(candidates)
-        chosen = candidates[: self.syn_per_seg].astype(_np.int32)
+            perm_cpu = asnumpy(self.seg_perm[cell])
+            si = int(perm_cpu.sum(axis=-1).argmin())
+            self.seg_idx[cell, si] = self.source_dim
+            self.seg_perm[cell, si] = 0.0
+        else:
+            si = n_segs_now
+            self.n_segs[cell] += 1
+        chosen = self._choose_syn(active_src_cpu, self.syn_per_seg)
         self.seg_idx[cell, si, : len(chosen)] = xp.asarray(chosen)
         self.seg_perm[cell, si, : len(chosen)] = self.init_perm
-        self.n_segs[cell] += 1
+
+    def _choose_syn(self, active_src_cpu: _np.ndarray, k: int) -> _np.ndarray:
+        """Pick up to `k` synapse sources, capping location bits at loc_syn_cap.
+
+        Location sources (index ≥ n_cells) are limited so a segment is always
+        anchored to token-context cells; the rest are filled with cell sources."""
+        if self.loc_syn_cap is None or not self.loc_dim:
+            cand = active_src_cpu.copy()
+            self.rng.shuffle(cand)
+            return cand[:k].astype(_np.int32)
+        cell_src = active_src_cpu[active_src_cpu < self.n_cells]
+        loc_src = active_src_cpu[active_src_cpu >= self.n_cells]
+        self.rng.shuffle(cell_src)
+        self.rng.shuffle(loc_src)
+        loc_take = loc_src[: self.loc_syn_cap]
+        cell_take = cell_src[: max(0, k - len(loc_take))]
+        return _np.concatenate([cell_take, loc_take]).astype(_np.int32)
 
     # ── Main step (vectorised, GPU-accelerated) ───────────────────────────────
 
@@ -318,24 +373,51 @@ class CorticalColumn:
             pred_col_j, pred_r = xp.where(pred_col)                        # (K,) each
             winners[cell_grid[pred_col_j, pred_r]] = True
 
-        # Burst: one winner per burst col — cell with highest potential overlap
+        # Burst: one winner per burst col.  A cell with a matching segment
+        # (potential ≥ min_threshold) wins on potential; otherwise the LEAST-
+        # USED cell (fewest segments) wins.  Least-used selection distributes
+        # novel contexts across a column's cells — plain argmax-of-potential
+        # collapsed every novel context onto cell 0, merging unrelated
+        # sequence chains.
         burst_col_j = xp.where(burst_mask)[0]                              # (B,)
-        r_best = (bestpot_col[burst_mask].argmax(axis=1) if burst_col_j.size
-                  else xp.empty(0, xp.intp))
         if burst_col_j.size:
+            if not bool(src[: self.source_dim].any()):
+                # Sequence start (no context at all): anchor on cell 0 so the
+                # chain start is reproducible across epochs and at inference —
+                # least-used would drift as segment counts change.
+                r_best = xp.zeros(burst_col_j.size, dtype=xp.intp)
+            else:
+                pots_b = bestpot_col[burst_mask].astype(xp.float32)        # (B, cpc)
+                nsegs_b = n_segs_c.reshape(n_cols, self.cpc)[burst_mask]
+                sel = xp.where(pots_b >= self.min_threshold, pots_b + 1e4,
+                               -nsegs_b.astype(xp.float32))
+                r_best = sel.argmax(axis=1)
             winners[cell_grid[burst_col_j, r_best]] = True
+        else:
+            r_best = xp.empty(0, xp.intp)
 
         self.last_bursts = int(burst_col_j.size)
         self.last_active_cols = n_cols
 
         # ── Learning ─────────────────────────────────────────────────────────
+        # No learning on an empty source (first token of a sequence): adapting
+        # against an all-inactive source only decays permanences, and grown
+        # segments would have zero synapses.
         if learn:
-            inc = self.inc * modulation
-            dec = self.dec * modulation
             # active_src computed on CPU: grow operations use numpy RNG
             active_src_cpu = _np.where(
                 asnumpy(src[: self.source_dim])
             )[0].astype(_np.int32)
+            learn = bool(active_src_cpu.size)
+        if learn:
+            inc = self.inc * modulation
+            dec = self.dec * modulation
+
+            # Punish segments that predicted a column which did not activate.
+            # Without this, false-predictive segments accumulate and the
+            # predictive union grows until decoding is impossible.
+            if self.pred_dec > 0:
+                self._punish_false_predictions(src, feature_sdr)
 
             # --- Predicted cells: batch-adapt best segment ---
             if predicted_any.any():
@@ -419,6 +501,40 @@ class CorticalColumn:
         conn_c, _, valid_c = self._compute_overlaps_scoped(src, cells)
         predictive = ((conn_c >= self.activation_threshold) & valid_c).any(axis=1)
         return xp.unique((cells[predictive] // self.cpc).astype(xp.int32))
+
+    def predict_column_scores(
+        self, loc_next_sdr: _np.ndarray
+    ) -> tuple[_np.ndarray, _np.ndarray]:
+        """
+        Predicted mini-columns for the NEXT token, with prediction strength.
+
+        Strength per column = sum over its predictive cells of the strongest
+        segment's connected overlap — a graded signal, unlike the binary set
+        from predict_columns().
+
+        Returns (cols, scores) as CPU numpy arrays (int32 sorted, float32);
+        decoding against the token inventory is CPU-side.
+        """
+        src = xp.zeros(self.source_dim + 1, dtype=xp.bool_)
+        src[: self.n_cells] = self.last_winners
+        if loc_next_sdr.size:
+            src[self.n_cells + xp.asarray(loc_next_sdr)] = True
+
+        cells = xp.where(self.n_segs > 0)[0]
+        if cells.size == 0:
+            return _np.empty(0, _np.int32), _np.empty(0, _np.float32)
+        conn_c, _, valid_c = self._compute_overlaps_scoped(src, cells)
+        pred_mask = (conn_c >= self.activation_threshold) & valid_c
+        cell_pred = pred_mask.any(axis=1)
+        if not cell_pred.any():
+            return _np.empty(0, _np.int32), _np.empty(0, _np.float32)
+        strength = xp.where(pred_mask, conn_c, 0).max(axis=1)
+        cells_np = asnumpy(cells[cell_pred])
+        strength_np = asnumpy(strength[cell_pred]).astype(_np.float32)
+        scores = _np.zeros(self.col_dim, dtype=_np.float32)
+        _np.add.at(scores, cells_np // self.cpc, strength_np)
+        cols = _np.where(scores > 0)[0].astype(_np.int32)
+        return cols, scores[cols]
 
     def reset(self) -> None:
         """Clear temporal state (call before each new sequence)."""

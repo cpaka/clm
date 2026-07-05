@@ -55,6 +55,18 @@ class GridLocation:
         ph = (self._phase + steps_ahead) % self.periods
         return np.sort(self.offsets + ph).astype(np.int32)
 
+    def at(self, i: int) -> np.ndarray:
+        """Sparse location SDR at absolute path-integration index `i`.
+
+        Stateless (no mutation): the location of step `i` is `i mod period` on
+        each ring.  This makes the next step's location trivially predictable
+        (`at(len(context))`), which is what lets the temporal memory query a
+        location it will only arrive at on the following token.  With small
+        co-prime periods the code wraps quickly, so it encodes a repeating
+        phrase rhythm rather than unbounded absolute position."""
+        ph = i % self.periods
+        return np.sort(self.offsets + ph).astype(np.int32)
+
     def dense(self, steps_ahead: int = 0) -> np.ndarray:
         """Dense bool vector at current + steps_ahead."""
         v = np.zeros(self.dim, dtype=np.bool_)

@@ -171,22 +171,23 @@ This is where sequence learning happens.</p>
 <h3>Structure: mini-columns and cells</h3>
 
 <pre>
-CorticalColumn  (col_dim=1024 mini-columns × cells_per_col=8 cells = 8192 cells)
+CorticalColumn  (col_dim=1024 mini-columns × cells_per_col=4 cells = 4096 cells)
 
 Mini-column 0        Mini-column 1        …  Mini-column 1023
 ┌──────────────┐    ┌──────────────┐           ┌──────────────┐
 │  cell 0  [seg] [seg] …           │           │  cell 0      │
 │  cell 1  [seg] [seg] …           │           │  cell 1      │
-│  …                               │           │  …           │
-│  cell 7                          │           │  cell 7      │
+│  cell 2                          │           │  cell 2      │
+│  cell 3                          │           │  cell 3      │
 └──────────────┘    └──────────────┘           └──────────────┘
       ↑                   ↑
   SDR bit 0           SDR bit 1
  "cat" activates   "cat" activates
   this column       this column
 
-Each cell has up to max_segs=16 dendritic segments.
-Each segment has syn_per_seg=20 synapses connecting to previous winner cells.
+Each cell has up to max_segs=8 dendritic segments.  When a cell is full, the
+weakest segment (lowest total permanence) is recycled — learning never stops.
+Each segment has syn_per_seg=12 synapses connecting to previous winner cells.
 </pre>
 
 <h3>Predictive vs burst state</h3>
@@ -203,8 +204,16 @@ PREDICTIVE step (column already learned "the → cat"):
 BURST step (first time seeing "the cat"):
   Token "the" arrives → column 87 activates
   No cell in column 87 is predictive (no segment connects to prev "the" winners)
-  ALL 8 cells in column 87 fire → BURST
+  ALL 4 cells in column 87 fire → BURST
   <span class="y">⚡ Surprise! Model didn't predict this → ALL cells fire → learning triggered</span>
+
+Burst winner selection (which cell learns the new context):
+  1. A cell with a MATCHING segment (potential overlap ≥ min_threshold)
+     wins on potential — the same cell keeps learning the same transition
+  2. Otherwise the LEAST-USED cell (fewest segments) wins — novel contexts
+     spread across the column's cells instead of merging onto one cell
+  3. At sequence start (no context at all) cell 0 is chosen deterministically
+     so chains are reproducible across epochs and at inference
 </pre>
 
 <h3>Permanence: the synaptic learning signal</h3>
@@ -218,11 +227,21 @@ During learning (Hebbian rule):
     permanence += inc = 0.10   <span class="g">← strengthen</span>
   If presynaptic cell was NOT active AND postsynaptic cell is winner:
     permanence -= dec = 0.02   <span class="y">← weaken</span>
+  If a segment PREDICTED a column that did NOT activate:
+    permanence -= pred_dec = 0.01   <span class="y">← punish false prediction</span>
+
+Punishment keeps the predictive set sharp: without it, spurious segments
+accumulate until a third of all columns are "predicted" at every step and
+decoding becomes impossible.
+
+No learning happens on the first token of a sequence — there is no previous
+context to connect to, so adapting would only decay permanences and grow
+empty (zero-synapse) segments.
 
 After enough repetitions of "the → cat":
   Segment in "cat" column → prev "the" winners:
-  permanences → [0.8, 0.9, 0.7, …]  (20 synapses all ≥ 0.5)
-  Connected overlap = 20 ≥ activation_threshold = 8
+  permanences → [0.8, 0.9, 0.7, …]  (12 synapses all ≥ 0.5)
+  Connected overlap = 12 ≥ activation_threshold = 5
   → Cell fires PREDICTIVELY next time "the" is seen
 </pre>
 
@@ -232,8 +251,10 @@ gather-and-reduce:</p>
 <ol>
   <li><strong>Gather</strong> — index <code>seg_idx[active_cells]</code> to get all synapse sources for active cells</li>
   <li><strong>Reduce</strong> — count connected active synapses per (cell, segment) pair</li>
-  <li><strong>Select winners</strong> — predicted cells win; burst cells choose highest-potential cell</li>
-  <li><strong>Batch adapt</strong> — update permanences for all winning (cell, segment) pairs at once</li>
+  <li><strong>Select winners</strong> — predicted cells win; burst cells pick the best-matching
+      segment's cell, or the least-used cell for novel contexts</li>
+  <li><strong>Batch adapt</strong> — update permanences for all winning (cell, segment) pairs at once;
+      punish predictive segments whose column did not activate (<code>pred_dec</code>)</li>
 </ol>
 
 <!-- ═══════════════════════════════════════════════════════════════════ -->
@@ -247,12 +268,13 @@ gather-and-reduce:</p>
 t=0: token="the"  fingerprint bits={3, 87, 143, 201, …}
   → cols 3, 87, 143, 201 … are active
   → no prev winners → all columns BURST (surprise=100%)
-  → one cell per col chosen as winner: w₀ = {3·2, 87·5, 143·1, …}
+  → winner anchored on cell 0 per column: w₀ = {3·0, 87·0, 143·0, …}
+  → <span class="c">NO learning (no previous context to connect to)</span>
 
 t=1: token="cat"  fingerprint bits={12, 87, 201, 310, …}
   → cols 12, 87, 201, 310 … are active
   → check segments: no segment connects to w₀ → BURST
-  → winners: w₁ = {12·0, 87·3, 201·6, …}
+  → winners (least-used cells): w₁ = {12·0, 87·3, 201·2, …}
   → <span class="y">LEARN: grow new segment in each winner cell, connect to w₀</span>
 
 t=2: token="sat"  fingerprint bits={5, 88, 150, 300, …}
@@ -266,7 +288,7 @@ t=2: token="sat"  fingerprint bits={5, 88, 150, 300, …}
 t=0: token="the"  → cols burst (no prior context)  winners=w₀ (same cells)
 
 t=1: token="cat"  → segments in cat-cols have synapses connecting to w₀
-  connected overlap ≥ 8 → cells in cat-cols PREDICT before "cat" arrives
+  connected overlap ≥ 5 → cells in cat-cols PREDICT before "cat" arrives
   → only w₁ cells fire (narrow, single-cell-per-column)
   <span class="g">✓ "cat" was predicted given "the"!</span>
 
@@ -330,10 +352,12 @@ Level 1 (stride=4, PHRASE granularity)
 </pre>
 
 <h3>SparseProjection between levels</h3>
-<p>Level-0 winner cells (8192-dimensional dense bool) are projected through a fixed
+<p>Level-0 winner cells (4096-dimensional dense bool) are projected through a fixed
 random sparse matrix to produce a 21-bit feature SDR for Level 1. This is analogous
 to thalamo-cortical projections — a fixed anatomical wiring that compresses
-fine-grained temporal activity into a coarser phrase-level signal.</p>
+fine-grained temporal activity into a coarser phrase-level signal.
+Each unit projects <em>its own</em> winners upward, and the upper-level columns are
+reset per sequence — training and inference run the identical per-unit pathway.</p>
 
 <h3>Grid location cells (currently disabled)</h3>
 <p>The architecture includes a <code>GridLocation</code> module that generates position-sensitive
@@ -369,6 +393,33 @@ improving robustness to ambiguous inputs. This mirrors the Thousand Brains Theor
 each cortical column maintains a complete model of the world; consensus emerges
 from voting across columns.</p>
 
+<h3>Decoding predictions into words</h3>
+<p>Each unit's temporal memory outputs <em>predicted mini-columns</em> with a graded
+strength (the connected overlap of the segments that predict them). A candidate
+word's score is the strength-weighted fraction of <strong>its own fingerprint bits</strong>
+that are predicted:</p>
+
+<pre>
+score(word) = Σ strength(bit)  over  bit ∈ fingerprint(word)   ÷   fp_bits
+              (strengths normalised to the strongest predicted column)
+
+  • Identity-core bits are weighted 3× — cores are unique per word, so
+    they separate the exact predicted word from its semantic neighbours
+    (shell bits are shared between similar words by design).
+  • Context echoes are demoted: tokens already in the context ×0.35,
+    the immediately preceding token ×0.1 — the model must predict the
+    NEXT word, not re-emit the current one.
+</pre>
+
+<div class="callout">
+  <strong>Why coverage, not per-bit rarity:</strong> an earlier decoder summed an
+  inverse-popularity (IDF) weight per predicted bit. With ~41 words sharing each
+  bit (2 001 words × 21 bits in 1 024 positions), a fully-predicted frequent word
+  scored <em>less</em> than a wrong word owning one rare bit — top-1 accuracy pinned
+  at exactly 0 %. Scoring each word by how much of <em>its own</em> fingerprint is
+  predicted removes that bias.
+</div>
+
 <h3>Parallel training</h3>
 <p>In <code>make train-parallel</code>, each unit trains in its own Modal container simultaneously.
 After all units finish, they are assembled into the ensemble and the merged model is
@@ -399,7 +450,9 @@ added incrementally.</p>
 <h3>Saturation &amp; capacity growth (#9, #10)</h3>
 <p>When the burst rate plateaus over 3 epochs (is_saturated=True), the model has
 learned as much as its current capacity allows. The daily ingest cron job
-automatically appends a new CLMUnit to the ensemble, adding fresh capacity.</p>
+automatically appends a new CLMUnit to the ensemble, adding fresh capacity.
+Within a full cell, new contexts recycle the weakest segment (lowest total
+permanence) instead of being silently dropped, so recent data always lands.</p>
 
 <h3>Corpus scaling plan (V4)</h3>
 <table>
@@ -448,13 +501,14 @@ to the small candidate arrays, not the full weight matrices.</p>
 <table>
   <tr><th>Parameter</th><th>Value</th><th>Effect</th></tr>
   <tr><td><code>col_dim</code></td><td>1024</td><td>SDR width; also the encoder fingerprint dimension</td></tr>
-  <tr><td><code>cells_per_col</code></td><td>8</td><td>Context depth; more cells = more disambiguation capacity</td></tr>
+  <tr><td><code>cells_per_col</code></td><td>4</td><td>Context depth; more cells = more disambiguation capacity</td></tr>
   <tr><td><code>fp_bits</code></td><td>21</td><td>Active bits per fingerprint; controls sparsity (~2 %)</td></tr>
-  <tr><td><code>index_bits</code></td><td>7</td><td>Fixed identity core bits in each fingerprint</td></tr>
+  <tr><td><code>index_bits</code></td><td>7</td><td>Fixed identity core bits in each fingerprint (3× weight at decode)</td></tr>
   <tr><td><code>window</code></td><td>4</td><td>Co-occurrence window for semantic encoder</td></tr>
-  <tr><td><code>max_segs</code></td><td>16</td><td>Max segments per cell; bounds memory per cell</td></tr>
-  <tr><td><code>syn_per_seg</code></td><td>20</td><td>Synapses per segment; must overlap ≥ 8 to activate</td></tr>
-  <tr><td><code>activation_threshold</code></td><td>8</td><td>Connected synapses needed for a segment to fire</td></tr>
+  <tr><td><code>max_segs</code></td><td>8</td><td>Max segments per cell; weakest segment recycled when full</td></tr>
+  <tr><td><code>syn_per_seg</code></td><td>12</td><td>Synapses per segment; must overlap ≥ 5 to activate</td></tr>
+  <tr><td><code>activation_threshold</code></td><td>5</td><td>Connected synapses needed for a segment to fire</td></tr>
+  <tr><td><code>pred_dec</code></td><td>0.01</td><td>Punishment for segments that predicted a column that stayed inactive</td></tr>
   <tr><td><code>vocab_size</code></td><td>2000</td><td>Rare words → &lt;UNK&gt;; improves bigram coverage</td></tr>
   <tr><td><code>n_units</code></td><td>3</td><td>Voting ensemble size</td></tr>
   <tr><td><code>n_levels</code></td><td>2</td><td>Hierarchy depth (token + phrase level)</td></tr>
@@ -464,8 +518,8 @@ to the small candidate arrays, not the full weight matrices.</p>
 <div class="callout">
   <strong>Memory footprint per unit:</strong>
   <code>n_cells × max_segs × syn_per_seg × 8 bytes</code> (idx + perm) =
-  <code>8192 × 16 × 20 × 8</code> = <strong>20 MB per unit</strong>.
-  Three units + two levels = ~120 MB total.
+  <code>4096 × 8 × 12 × 8</code> = <strong>~3 MB per unit</strong>.
+  Three units + two levels = ~19 MB total.
 </div>
 
 </div><!-- /page -->

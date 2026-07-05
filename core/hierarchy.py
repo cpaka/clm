@@ -42,7 +42,15 @@ from .grid import GridLocation
 from .column import CorticalColumn
 from .modulation import NeuromodSignal
 from .replay import HippocampalBuffer
+from .pooling import ContextPool
+from .spatial_pooler import SpatialPooler
 from .xp import asnumpy
+
+# Default co-prime periods for the level-0 location code.  Small and co-prime:
+# the LCM (2310) is far larger than any sentence, but each individual ring wraps
+# within a few tokens, so location encodes a repeating phrase rhythm rather than
+# unbounded absolute position (which would make segments position-specific).
+DEFAULT_LOC_PERIODS: tuple[int, ...] = (2, 3, 5, 7, 11)
 
 
 # ── Projection layer (between levels) ────────────────────────────────────────
@@ -110,10 +118,18 @@ class CLMUnit:
         periods: tuple[int, ...],
         encoder,               # TokenEncoder | SemanticEncoder | None (external feature SDR)
         seed: int = 0,
+        use_location: bool = False,
+        loc_periods: tuple[int, ...] | None = None,
+        use_spatial_pooler: bool = False,
+        sp_kwargs: dict | None = None,
         **col_kwargs,
     ):
         self.enc = encoder
-        self.grid = GridLocation(periods)
+        self.use_location = use_location
+        # The grid drives the location code (improvement #3).  Small co-prime
+        # periods keep it a bounded phrase rhythm.  When location is disabled the
+        # grid still sizes the column's (tiny) location space but is never fed.
+        self.grid = GridLocation(loc_periods or DEFAULT_LOC_PERIODS)
         self.col = CorticalColumn(
             col_dim, cells_per_col, self.grid.dim, seed=seed, **col_kwargs
         )
@@ -121,26 +137,74 @@ class CLMUnit:
         self._token_sdr: dict[str, np.ndarray] = {}
         self._inv: dict[int, list[str]] = defaultdict(list)  # bit → token list
 
+        # Spatial Pooler (learned representations) — level-0 only (needs an
+        # encoder to pool over).  When present, a token's active mini-columns are
+        # the SP's *learned* output SDR rather than the encoder's fixed
+        # fingerprint; the temporal memory then learns sequences over learned
+        # representations.  Fit once, frozen, and cached (see fit_pooler).
+        self.use_sp = bool(use_spatial_pooler and encoder is not None)
+        self.sp: SpatialPooler | None = (
+            SpatialPooler(input_dim=col_dim, col_dim=col_dim, active_cols=w,
+                          seed=seed, **(sp_kwargs or {}))
+            if self.use_sp else None
+        )
+
+    def _encode(self, tok: str) -> np.ndarray:
+        """Raw encoder fingerprint (input to the Spatial Pooler when present)."""
+        return self.enc.encode(tok)
+
     def _sdr(self, tok: str) -> np.ndarray:
+        """Active mini-columns for a token: SP-learned SDR if a (frozen) Spatial
+        Pooler is present, else the encoder fingerprint.  Cached; also builds the
+        bit→token inverted index used by the decoder."""
         s = self._token_sdr.get(tok)
         if s is None:
-            s = self.enc.encode(tok)
+            s = self.sp.compute(self._encode(tok), learn=False) if self.use_sp \
+                else self.enc.encode(tok)
             self._token_sdr[tok] = s
             for b in s:
                 self._inv[int(b)].append(tok)
         return s
 
-    # Shared empty loc_sdr: grid location is NOT wired into temporal-memory
-    # segments so patterns generalise across positions.  Grid kept as object
-    # for potential future use (spatial feature encoding, replay indexing).
+    def fit_pooler(self, tokens: list[str], passes: int = 3) -> None:
+        """Learn the Spatial Pooler on the token inventory, then freeze + cache.
+
+        The SP output depends only on a token's (fixed) encoder fingerprint, so
+        it suffices to iterate the unique tokens; boosting spreads the learned
+        representation across the whole column population.  After freezing, the
+        token→SDR map is deterministic and cached, so the temporal memory trains
+        on stable learned representations at no extra per-step cost."""
+        if not self.use_sp or self.sp._frozen:
+            return
+        vocab = list(dict.fromkeys(tokens))          # unique, order-preserving
+        rng = np.random.default_rng(0)
+        for _ in range(passes):
+            rng.shuffle(vocab)
+            for tok in vocab:
+                self.sp.compute(self._encode(tok), learn=True)
+        self.sp.freeze()
+        # Reset any cache built before freezing so _sdr rebuilds from frozen SP.
+        self._token_sdr.clear()
+        self._inv = defaultdict(list)
+
+    # Shared empty loc_sdr for levels/units that run without a location code.
     _NO_LOC = np.empty(0, dtype=np.int32)
+
+    def _loc(self, i: int) -> np.ndarray:
+        """Location SDR at path-integration index `i` (empty if disabled).
+
+        Path integration is deterministic (+1 per token), so the location of the
+        yet-unseen next token is simply `_loc(len(context))` — forward
+        predictable, which is what makes the location code usable for
+        prediction rather than only postdiction."""
+        return self.grid.at(i) if self.use_location else self._NO_LOC
 
     def train_sequence(self, tokens: list[str], modulation: float = 1.0) -> float:
         """Train on one sequence. Returns burst rate (burst cols / active cols)."""
         self.col.reset()
         bursts = total = 0
-        for tok in tokens:
-            self.col.step(self._sdr(tok), self._NO_LOC, learn=True,
+        for i, tok in enumerate(tokens):
+            self.col.step(self._sdr(tok), self._loc(i), learn=True,
                           modulation=modulation)
             bursts += self.col.last_bursts
             total += self.col.last_active_cols
@@ -159,25 +223,59 @@ class CLMUnit:
         return bursts / total if total else 0.0
 
     def score_next(self, tokens: list[str]) -> dict[str, float]:
-        """Run context and return token → IDF-weighted normalised overlap score."""
+        """Run context and return token → weighted fingerprint-coverage score.
+
+        A token scores by the strength-weighted fraction of ITS OWN fingerprint
+        bits that are predicted (∈ [0, 1] after per-step normalisation) — not
+        by a per-bit IDF sum, which systematically favoured rare-bit tokens
+        regardless of how little of their fingerprint was predicted."""
         self.col.reset()
-        for tok in tokens:
-            self.col.step(self._sdr(tok), self._NO_LOC, learn=False)
-        pred_cols = asnumpy(self.col.predict_columns(self._NO_LOC))
-        scores: dict[str, float] = defaultdict(float)
+        for i, tok in enumerate(tokens):
+            self.col.step(self._sdr(tok), self._loc(i), learn=False)
+        return self._decode_scores(
+            *self.col.predict_column_scores(self._loc(len(tokens)))
+        )
+
+    # Identity-core bits are unique per token; shell bits are shared between
+    # semantically similar tokens.  Weighting cores higher separates the exact
+    # predicted token from its semantic neighbours at decode time.
+    _CORE_WEIGHT = 3.0
+    # Graded decode weights columns by prediction strength; binary treats all
+    # predicted columns equally.
+    _GRADED = True
+
+    def _decode_scores(
+        self, pred_cols: np.ndarray, strengths: np.ndarray
+    ) -> dict[str, float]:
+        """Decode predicted columns (+ strengths) against the token inventory."""
+        if pred_cols.size == 0:
+            return {}
+        smap = np.zeros(self.col.col_dim, dtype=np.float32)
+        smap[pred_cols] = (strengths / strengths.max()) if self._GRADED else 1.0
+        candidates: set[str] = set()
         for b in pred_cols:
-            toks = self._inv.get(int(b), ())
-            if toks:
-                idf = 1.0 / len(toks)   # rare bits discriminate more
-                for tok in toks:
-                    scores[tok] += idf
-        return {t: v / self.w for t, v in scores.items()}
+            candidates.update(self._inv.get(int(b), ()))
+
+        # Identity-core weighting only makes sense when columns ARE the encoder
+        # fingerprint; with a Spatial Pooler the columns are learned, so the core
+        # bits no longer index them.
+        semantic = isinstance(self.enc, SemanticEncoder) and not self.use_sp
+        scores: dict[str, float] = {}
+        for tok in candidates:
+            sc = float(smap[self._token_sdr[tok]].sum())
+            denom = float(self.w)
+            if semantic:
+                core = self.enc.index_vec(tok)
+                sc += (self._CORE_WEIGHT - 1.0) * float(smap[core].sum())
+                denom += (self._CORE_WEIGHT - 1.0) * core.size
+            scores[tok] = sc / denom
+        return scores
 
     def get_winners_after(self, tokens: list[str]) -> np.ndarray:
         """Run context, return last_winners dense bool for upward projection."""
         self.col.reset()
-        for tok in tokens:
-            self.col.step(self._sdr(tok), self._NO_LOC, learn=False)
+        for i, tok in enumerate(tokens):
+            self.col.step(self._sdr(tok), self._loc(i), learn=False)
         return asnumpy(self.col.last_winners)
 
     def reset(self) -> None:
@@ -272,6 +370,17 @@ class HierarchicalCLM:
     replay_thresh : burst rate threshold for episode storage
     """
 
+    # Echo-demotion factors applied to context tokens at decode time (1.0 = off).
+    ECHO_DEMOTE_CONTEXT = 0.35
+    ECHO_DEMOTE_LAST = 0.1
+
+    # ── Inference-time knobs for improvements #1/#2/#4 (class defaults; copied
+    # to instance attributes so they can be swept without persistence churn) ──
+    POOL_W = 48              # active bits in the context-pooling SDR (#1)
+    POOL_DECAY = 0.92        # per-token decay of the pool accumulator (#1)
+    APICAL_WEIGHT = 0.25     # weight of the pool→token consistency bias (#2)
+    CONSENSUS_POWER = 0.5    # agreement exponent for cross-unit voting (#4)
+
     def __init__(
         self,
         n_levels: int = 2,
@@ -289,6 +398,10 @@ class HierarchicalCLM:
         replay_cap: int = 512,
         replay_thresh: float = 0.3,
         seed_base: int = 0,
+        use_location: bool = False,
+        loc_periods: tuple[int, ...] | None = None,
+        use_spatial_pooler: bool = False,
+        sp_kwargs: dict | None = None,
         **col_kwargs,
     ):
         assert len(strides) == n_levels, "strides must have one entry per level"
@@ -321,13 +434,36 @@ class HierarchicalCLM:
         # Projections between levels: proj[l] maps level-l winners to level-(l+1) features
         self._projections: list[SparseProjection] = []
 
+        # Location code (#3): each level-0 unit path-integrates a small co-prime
+        # grid and feeds it as a soft distal cue.  OFF by default — on free text
+        # it slightly hurts (position dilutes the token-context match) and adds
+        # compute, so it earns its cost only on positionally-structured data.
+        # loc_periods and use_location ride in _col_kwargs so they thread to every
+        # CLMUnit and round-trip through persistence; loc_syn_cap reaches the column.
+        self.use_location = use_location
+        self.loc_periods = tuple(loc_periods) if loc_periods else DEFAULT_LOC_PERIODS
+
+        # Spatial Pooler (learned SDR representations).  Fit once, then frozen.
+        self.use_spatial_pooler = use_spatial_pooler
+        self._poolers_fit = False
+
+        # Inference knobs (#1/#2/#4) — instance copies of the class defaults.
+        self.pool_w = self.POOL_W
+        self.pool_decay = self.POOL_DECAY
+        self.apical_weight = self.APICAL_WEIGHT
+        self.consensus_power = self.CONSENSUS_POWER
+
         # Levels are built lazily (after encoders are fit)
         self.levels: list[HierarchyLevel] = []
         # Extra CorticalColumn hyperparameters (activation_threshold, syn_per_seg,
-        # max_segs, connected, init_perm, inc, dec, pred_dec, min_threshold) are
-        # threaded straight through to every column.
+        # max_segs, connected, init_perm, inc, dec, pred_dec, min_threshold,
+        # loc_syn_cap) are threaded straight through to every column; use_location
+        # and loc_periods are consumed by CLMUnit before the column.
         self._col_kwargs: dict = dict(
-            cells_per_col=cells_per_col, periods=periods, **col_kwargs
+            cells_per_col=cells_per_col, periods=periods,
+            use_location=use_location, loc_periods=self.loc_periods,
+            use_spatial_pooler=use_spatial_pooler, sp_kwargs=sp_kwargs,
+            **col_kwargs
         )
         self._n_cells_l0: int = col_dim * cells_per_col
         self._periods = periods
@@ -401,6 +537,15 @@ class HierarchicalCLM:
         for enc in self._encoders:
             enc.fit(sequences)
 
+    def _fit_poolers(self, sequences: list[list[str]]) -> None:
+        """Fit + freeze each level-0 unit's Spatial Pooler (once)."""
+        if not self.use_spatial_pooler or self._poolers_fit:
+            return
+        tokens = [t for seq in sequences for t in seq]
+        for unit in self.levels[0].units:
+            unit.fit_pooler(tokens)
+        self._poolers_fit = True
+
     def inject_units(self, units: list) -> None:
         """Replace level-0 voting units with pre-trained CLMUnit objects.
 
@@ -434,6 +579,7 @@ class HierarchicalCLM:
         if self.encoder_type == "semantic" and self._encoders is None:
             self.fit_encoders(sequences)
         self._build()
+        self._fit_poolers(sequences)
 
         for epoch in range(epochs):
             burst_total = total_seqs = 0
@@ -470,51 +616,46 @@ class HierarchicalCLM:
             modulation = self.neuromod.modulation
 
         no_loc = CLMUnit._NO_LOC
-        step_counts = [0] * self.n_levels
-        level_features: list[list[np.ndarray]] = [[] for _ in range(self.n_levels)]
 
-        for unit in self.levels[0].units:
-            unit.col.reset()
+        # Reset ALL levels — inference resets them too, and phrase-level state
+        # must not leak across unrelated sequences.
+        for lvl in self.levels:
+            for unit in lvl.units:
+                unit.col.reset()
 
-        bursts_l0 = active_l0 = 0
-        for tok in seq:
+        # Last winners per (level, unit): each unit feeds ITS OWN winners
+        # upward, matching predict_next()'s per-unit projection at inference.
+        last_winners: list[list[np.ndarray | None]] = [
+            [None] * self.n_units for _ in range(self.n_levels)
+        ]
+
+        bursts_l0 = active_l0 = steps = 0
+        for pos, tok in enumerate(seq):
             for uid, unit in enumerate(self.levels[0].units):
-                ftr = unit._sdr(tok)
-                winners = unit.col.step(ftr, no_loc, learn=True, modulation=modulation)
+                winners = unit.col.step(unit._sdr(tok), unit._loc(pos), learn=True,
+                                        modulation=modulation)
+                last_winners[0][uid] = winners
                 if uid == 0:
-                    level_features[0].append(winners.copy())
                     bursts_l0 += unit.col.last_bursts
                     active_l0 += unit.col.last_active_cols
 
-            step_counts[0] += 1
+            steps += 1
             for lvl in range(1, self.n_levels):
-                if step_counts[0] % self.strides[lvl] == 0:
-                    self._step_upper_level(lvl, level_features, step_counts, modulation)
+                if steps % self.strides[lvl] != 0:
+                    continue
+                for uid in range(self.n_units):
+                    below = last_winners[lvl - 1][uid]
+                    if below is None:
+                        continue
+                    # asnumpy: winners may live on GPU; SparseProjection is numpy
+                    ftr = self._projections[lvl - 1].project(asnumpy(below))
+                    last_winners[lvl][uid] = self.levels[lvl].units[uid].col.step(
+                        ftr, no_loc, learn=True, modulation=modulation
+                    )
 
         burst_rate = bursts_l0 / max(active_l0, 1)
         self.neuromod.update(burst_rate > 0.5)
         return burst_rate
-
-    def _step_upper_level(
-        self,
-        lvl: int,
-        level_features: list[list[np.ndarray]],
-        step_counts: list[int],
-        modulation: float,
-    ) -> None:
-        """Project level-(lvl-1) winners up to level-lvl and run one step."""
-        if not level_features[lvl - 1]:
-            return
-        # asnumpy: winners may live on GPU; SparseProjection uses numpy matmul
-        prev_winners = asnumpy(level_features[lvl - 1][-1])
-        ftr = self._projections[lvl - 1].project(prev_winners)
-        no_loc = CLMUnit._NO_LOC
-        for unit in self.levels[lvl].units:
-            unit.col.step(ftr, no_loc, learn=True, modulation=modulation)
-        level_features[lvl].append(
-            self.levels[lvl].units[0].col.last_winners.copy()
-        )
-        step_counts[lvl] += 1
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
@@ -522,75 +663,93 @@ class HierarchicalCLM:
         """
         Predict the next token given a context.
 
-        Level-0 units vote via IDF-weighted token SDR overlap.  Upper levels
-        are driven at their natural temporal strides; their predicted feature
-        columns are back-projected into level-0 token space and blended at a
-        reduced weight (0.25).  k-WTA sharpens the aggregate score before
-        decoding.
+        Each level-0 unit decodes its predicted columns into token scores by
+        fingerprint coverage.  Three cortical mechanisms sharpen the result:
 
+          • Location (#3): a path-integrated grid code disambiguates context by
+            phrase position; the next location is known (path integration is
+            deterministic), so it conditions the prediction.
+          • Apical context bias (#2) from an online pooling "output layer" (#1):
+            candidates whose fingerprint overlaps the running context SDR are
+            boosted, replacing the old fixed-weight upper-level back-projection.
+          • Consensus voting (#4): tokens predicted by more units are weighted
+            super-linearly, so the ensemble converges on agreement.
+
+        k-WTA then applies lateral inhibition before ranking.
         Returns list of (token, score) sorted descending.
         """
         self._build()
-        raw_scores: dict[str, float] = defaultdict(float)
 
         # Reset all levels before running context
         for lvl in self.levels:
             for unit in lvl.units:
                 unit.col.reset()
 
+        units0 = self.levels[0].units
+        pools = [ContextPool(self.col_dim, self.pool_w, self.pool_decay)
+                 for _ in units0]
+
         # Run context through all levels, mirroring the training stride pattern
-        l0_winners: list[np.ndarray] = [
-            np.zeros(self.levels[0].n_cells, dtype=bool) for _ in range(self.n_units)
+        last_winners: list[list[np.ndarray | None]] = [
+            [None] * self.n_units for _ in range(self.n_levels)
         ]
         step_count = 0
-        for tok in tokens:
-            for uid, unit in enumerate(self.levels[0].units):
-                unit.col.step(unit._sdr(tok), CLMUnit._NO_LOC, learn=False)
-                l0_winners[uid] = asnumpy(unit.col.last_winners)
+        for pos, tok in enumerate(tokens):
+            for uid, unit in enumerate(units0):
+                fp = unit._sdr(tok)
+                unit.col.step(fp, unit._loc(pos), learn=False)
+                last_winners[0][uid] = asnumpy(unit.col.last_winners)
+                pools[uid].update(fp)                     # pool the active columns (#1)
             step_count += 1
             for lvl in range(1, self.n_levels):
-                if step_count % self.strides[lvl] == 0:
-                    for uid in range(self.n_units):
-                        ftr = self._projections[lvl - 1].project(l0_winners[uid])
-                        self.levels[lvl].units[uid].col.step(
-                            ftr, CLMUnit._NO_LOC, learn=False
-                        )
-
-        # Level-0: IDF-weighted token scores from predicted columns
-        for unit in self.levels[0].units:
-            pred_cols = asnumpy(unit.col.predict_columns(CLMUnit._NO_LOC))
-            for b in pred_cols:
-                toks = unit._inv.get(int(b), ())
-                if toks:
-                    idf = 1.0 / len(toks)
-                    for tok in toks:
-                        raw_scores[tok] += idf / unit.w
-
-        # Upper levels: back-project predicted feature columns → level-0 tokens
-        if self.n_levels > 1 and step_count >= self.strides[1]:
-            cpc = self.levels[0].units[0].col.cpc
-            upper_scores: dict[str, float] = defaultdict(float)
-            for uid, unit0 in enumerate(self.levels[0].units):
-                pred_l1 = asnumpy(
-                    self.levels[1].units[uid].col.predict_columns(CLMUnit._NO_LOC)
-                )
-                if pred_l1.size == 0:
+                if step_count % self.strides[lvl] != 0:
                     continue
-                cell_sc = self._projections[0].back_project_to_cells(pred_l1)
-                col_sc = cell_sc.reshape(self.col_dim, cpc).max(axis=1)
-                for col_idx in np.where(col_sc > 0)[0]:
-                    sc = float(col_sc[col_idx])
-                    for tok in unit0._inv.get(int(col_idx), ()):
-                        upper_scores[tok] += sc
+                for uid in range(self.n_units):
+                    below = last_winners[lvl - 1][uid]
+                    if below is None:
+                        continue
+                    ftr = self._projections[lvl - 1].project(asnumpy(below))
+                    unit_l = self.levels[lvl].units[uid]
+                    unit_l.col.step(ftr, CLMUnit._NO_LOC, learn=False)
+                    last_winners[lvl][uid] = asnumpy(unit_l.col.last_winners)
 
-            if upper_scores:
-                max_upper = max(upper_scores.values())
-                if max_upper > 0:
-                    for tok, sc in upper_scores.items():
-                        raw_scores[tok] += 0.25 * sc / max_upper
+        # Per-unit decode + apical bias, accumulating agreement for consensus.
+        loc_next = len(tokens)
+        tok_sum: dict[str, float] = defaultdict(float)
+        tok_cnt: dict[str, int] = defaultdict(int)
+        for uid, unit in enumerate(units0):
+            decoded = unit._decode_scores(
+                *unit.col.predict_column_scores(unit._loc(loc_next))
+            )
+            if not decoded:
+                continue
+            pool_sdr = pools[uid].sdr() if self.apical_weight else None
+            for tok, sc in decoded.items():
+                if pool_sdr is not None:
+                    fp = unit._token_sdr.get(tok)
+                    if fp is not None:
+                        sc += self.apical_weight * float(pool_sdr[fp].sum()) / unit.w
+                tok_sum[tok] += sc
+                tok_cnt[tok] += 1
 
-        if not raw_scores:
+        if not tok_sum:
             return []
+
+        # Consensus voting (#4): agreement across units weighted super-linearly.
+        raw_scores: dict[str, float] = {
+            tok: s * (tok_cnt[tok] / self.n_units) ** self.consensus_power
+            for tok, s in tok_sum.items()
+        }
+
+        # Demote context echoes: the task is to predict the NEXT token, but
+        # fingerprint self-overlap makes just-seen tokens systematic false
+        # winners.  The immediate last token is demoted hardest.
+        if self.ECHO_DEMOTE_CONTEXT < 1.0:
+            for t in set(tokens):
+                if t in raw_scores:
+                    raw_scores[t] *= self.ECHO_DEMOTE_CONTEXT
+        if tokens and tokens[-1] in raw_scores:
+            raw_scores[tokens[-1]] *= self.ECHO_DEMOTE_LAST
 
         # k-WTA on aggregate scores for lateral inhibition
         all_tokens = list(raw_scores)
@@ -722,7 +881,9 @@ class HierarchicalCLM:
             "strides": list(self.strides),
             "units_per_level": self.n_units,
             "encoder": self.encoder_type,
-            "vocab": len(u0._token_sdr),
+            # Encoder vocab, not the lazily-built SDR cache (which is empty
+            # until tokens are first encoded and misreported vocab=0 in logs).
+            "vocab": len(u0.enc.vocab) if u0.enc is not None else len(u0._token_sdr),
             "col_dim": self.col_dim,
             "fp_bits": self.fp_bits,
             "loc_dim": u0.grid.dim,

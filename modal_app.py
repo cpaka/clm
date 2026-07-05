@@ -95,6 +95,7 @@ MODEL_CONFIG = {
     "activation_threshold": 5, # compressed: 8→5 (keeps 40% ratio: 5/12 ≈ 8/20)
     "syn_per_seg": 12,         # compressed: 20→12 (1.7× faster inner loop)
     "max_segs": 8,             # compressed: 16→8 (2× faster segment scan)
+    "use_spatial_pooler": True,  # learn SDR representations (fit once, frozen, cached)
 }
 
 # ---------------------------------------------------------------------------
@@ -469,7 +470,7 @@ def warmup_cupy() -> dict:
         return {"status": "cupy_not_available", "seconds": 0}
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=3600, cpu=4)
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=7200, cpu=4)
 def train_unit(unit_id: int) -> dict:
     """Train ONE voting unit standalone and save it to unit_<id>.clm.
 
@@ -509,7 +510,7 @@ def train_unit(unit_id: int) -> dict:
     return {"unit": unit_id, "seconds": total, "vocab": m.stats()["vocab"]}
 
 
-@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=4500)
+@app.function(image=image, volumes={_VOL_MOUNT: vol}, timeout=9000)
 def train_parallel() -> dict:
     """Fan out unit training across containers, then assemble + save the ensemble."""
     import sys, time as _t

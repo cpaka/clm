@@ -1114,6 +1114,7 @@ CHAT_HTML = r"""<!DOCTYPE html>
     <button data-view="generate">Generate</button>
     <button data-view="dash">Dashboard</button>
     <button data-view="explore">Explore</button>
+    <button data-view="reason">Reason</button>
     <a href="/docs" target="_blank" style="color:#94a3b8;text-decoration:none;padding:0.4rem 0.9rem;border-radius:0.6rem;font-size:0.85rem;font-weight:600;" onmouseover="this.style.background='#334155'" onmouseout="this.style.background=''">Docs ↗</a>
   </nav>
   <div id="status-badge">loading&hellip;</div>
@@ -1178,6 +1179,24 @@ CHAT_HTML = r"""<!DOCTYPE html>
     </div>
     <canvas id="fpgrid" width="640" height="640"></canvas>
     <div class="neigh" id="neigh"></div>
+  </section>
+
+  <!-- REASON -->
+  <section id="reason" class="view">
+    <p class="muted">Reasoning over a knowledge space <b>grounded in the model's learned representations</b>. Analogy transfers a displacement (a : b :: c : ?); neighbours finds nearby concepts in that space. Answer quality is bounded by representation quality — a lightly-trained model gives a rough space.</p>
+    <div class="exrow">
+      <input id="anA" placeholder="a (e.g. king)" autocomplete="off"/>
+      <span class="muted" style="align-self:center">:</span>
+      <input id="anB" placeholder="b (e.g. queen)" autocomplete="off"/>
+      <span class="muted" style="align-self:center;font-weight:700">::</span>
+      <input id="anC" placeholder="c (e.g. man)" autocomplete="off"/>
+      <button class="act" id="reason-analogy-btn" style="background:#7c3aed;color:#fff">Analogy →</button>
+    </div>
+    <div class="exrow">
+      <input id="reasonWord" placeholder="word (e.g. water)" autocomplete="off"/>
+      <button class="act" id="reason-neigh-btn" style="background:#0ea5e9;color:#fff">Neighbours</button>
+    </div>
+    <div id="reason-out" class="muted" style="margin-top:1rem;line-height:1.9;min-height:60px"></div>
   </section>
 </main>
 <script>
@@ -1449,6 +1468,42 @@ async function showFingerprint() {
 $('fp-btn').onclick = showFingerprint;
 $('wordA').addEventListener('keydown', e => { if (e.key==='Enter') showFingerprint(); });
 $('wordB').addEventListener('keydown', e => { if (e.key==='Enter') showFingerprint(); });
+
+/* ---- reason: grounded knowledge-space reasoning ---- */
+async function runReason(url) {
+  const out = $('reason-out');
+  out.innerHTML = '<span class="muted">Reasoning…</span>';
+  try {
+    const d = await jget(url);
+    if (d.mode === 'analogy') {
+      out.innerHTML =
+        `<div style="font-size:1.05rem"><b>${d.a}</b> : <b>${d.b}</b> &nbsp;::&nbsp; <b>${d.c}</b> : `
+        + `<b style="color:#a78bfa">${d.answer ?? '(none)'}</b></div>`
+        + `<div class="muted" style="margin-top:.6rem">nearest to the transferred point: `
+        + (d.nearest||[]).map(([t,dist]) => `${t} (${dist})`).join(', ') + `</div>`;
+    } else if (d.mode === 'neighbors') {
+      out.innerHTML = `<div>nearest to <b>${d.word}</b> in the learned space:</div>`
+        + `<div style="margin-top:.5rem">`
+        + (d.neighbours||[]).map(([t,dist]) =>
+            `<span style="display:inline-block;background:#1e293b;border:1px solid #334155;border-radius:9999px;padding:3px 11px;margin:3px;font-size:.85rem;cursor:pointer" data-w="${t}">${t} · ${dist}</span>`).join('')
+        + `</div>`;
+      document.querySelectorAll('#reason-out span[data-w]').forEach(s =>
+        s.onclick = () => { $('reasonWord').value = s.dataset.w; $('reason-neigh-btn').click(); });
+    }
+  } catch(e) { out.innerHTML = '<span style="color:#f87171">⚠ ' + e.message + '</span>'; }
+}
+$('reason-analogy-btn').onclick = () => {
+  const a=$('anA').value.trim(), b=$('anB').value.trim(), c=$('anC').value.trim();
+  if (!a||!b||!c) { $('reason-out').innerHTML='<span class="muted">Fill a, b and c (a : b :: c : ?).</span>'; return; }
+  runReason('/reason?' + new URLSearchParams({mode:'analogy', a, b, c}));
+};
+$('reason-neigh-btn').onclick = () => {
+  const w=$('reasonWord').value.trim();
+  if (!w) { $('reason-out').innerHTML='<span class="muted">Enter a word.</span>'; return; }
+  runReason('/reason?' + new URLSearchParams({mode:'neighbors', word:w, k:8}));
+};
+['anA','anB','anC'].forEach(id => $(id).addEventListener('keydown', e => { if (e.key==='Enter') $('reason-analogy-btn').click(); }));
+$('reasonWord').addEventListener('keydown', e => { if (e.key==='Enter') $('reason-neigh-btn').click(); });
 
 loadStatus();
 setInterval(loadStatus, 30000);

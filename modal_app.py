@@ -1180,6 +1180,26 @@ CHAT_HTML = r"""<!DOCTYPE html>
 <script>
 const $ = id => document.getElementById(id);
 
+/* Robust JSON fetch: never blow up on an HTML/text error page (e.g. a 500
+   "Internal Server Error"), which used to surface as
+   "Unexpected token 'I', "Internal S"... is not valid JSON". */
+async function jget(url, opts) {
+  const r = await fetch(url, opts);
+  const body = await r.text();
+  let data = null;
+  try { data = body ? JSON.parse(body) : null; } catch (_) { data = null; }
+  if (!r.ok || data === null) {
+    const detail = (data && (data.error || data.detail))
+      || (body || '').replace(/<[^>]*>/g, '').trim().slice(0, 200)
+      || (r.status + ' ' + r.statusText);
+    if (r.status === 503 || /not\s*loaded|no model|training/i.test(detail))
+      throw new Error('Model is still training or loading — try again shortly.');
+    throw new Error(detail);
+  }
+  return data;
+}
+const POST_JSON = b => ({method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(b)});
+
 /* ---- tab switching ---- */
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('nav button').forEach(x => x.classList.remove('active'));
@@ -1238,16 +1258,15 @@ $('send-btn').onclick = async () => {
 
   if (Q_RE.test(t)) {
     try {
-      const r = await fetch('/qa?' + new URLSearchParams({question: t}));
-      const d = await r.json();
+      const d = await jget('/qa?' + new URLSearchParams({question: t}));
       if (d.error) { addMsg('bot', '⚠ ' + d.error); return; }
       addQAMsg(d);
-    } catch(e) { addMsg('bot', 'Error: ' + e.message); }
+    } catch(e) { addMsg('bot', '⚠ ' + e.message); }
   } else {
     try {
-      const r = await fetch('/generate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({tokens: t.toLowerCase().split(/\s+/), n: 20})});
-      const d = await r.json(); addMsg('bot', d.generated ? d.generated.join(' ') : '(no output)');
-    } catch(e) { addMsg('bot', 'Error: ' + e.message); }
+      const d = await jget('/generate', POST_JSON({tokens: t.toLowerCase().split(/\s+/), n: 20}));
+      addMsg('bot', d.generated ? d.generated.join(' ') : '(no output)');
+    } catch(e) { addMsg('bot', '⚠ ' + e.message); }
   }
 };
 
@@ -1255,11 +1274,10 @@ $('send-btn').onclick = async () => {
 $('predict-btn').onclick = async () => {
   const t = promptEl.value.trim(); if (!t) return; addMsg('user', t); promptEl.value = '';
   try {
-    const r = await fetch('/predict', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({tokens: t.toLowerCase().split(/\s+/), topn: 5})});
-    const d = await r.json();
+    const d = await jget('/predict', POST_JSON({tokens: t.toLowerCase().split(/\s+/), topn: 5}));
     if (d.predictions?.length) { const top = d.predictions[0][0]; const rest = d.predictions.slice(1).map(p=>p[0]).join(', '); addMsg('bot','→ '+top, rest?'also: '+rest:''); }
     else addMsg('bot','(no prediction)');
-  } catch(e) { addMsg('bot','Error: '+e.message); }
+  } catch(e) { addMsg('bot','⚠ '+e.message); }
 };
 
 promptEl.addEventListener('keydown', e => { if (e.key==='Enter') { e.preventDefault(); $('send-btn').click(); } });
@@ -1354,12 +1372,7 @@ $('gen-btn').onclick = async () => {
   try {
     const tokens = seed ? seed.toLowerCase().split(/\s+/) : [];
     const t0 = performance.now();
-    const r = await fetch('/generate', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({tokens, n})
-    });
-    const d = await r.json();
+    const d = await jget('/generate', POST_JSON({tokens, n}));
     const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
     if (d.error) { out.innerHTML = '<span style="color:#f87171">' + d.error + '</span>'; return; }
     const generated = d.generated || [];
@@ -1393,9 +1406,8 @@ $('gen-seed').addEventListener('keydown', e => { if (e.key === 'Enter') { e.prev
 
 /* ---- explore: fingerprint visualisation ---- */
 async function fp(word) {
-  const r = await fetch('/fingerprint?word=' + encodeURIComponent(word));
-  if (!r.ok) return null;
-  return await r.json();
+  try { return await jget('/fingerprint?word=' + encodeURIComponent(word)); }
+  catch (_) { return null; }
 }
 function drawGrid(dim, setA, setB) {
   const cv = $('fpgrid'), ctx = cv.getContext('2d');

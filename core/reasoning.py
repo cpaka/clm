@@ -22,6 +22,7 @@ import numpy as np
 
 from .vsa import RoleBook, Codebook, bundle, similarity
 from .displacement import GridSpace, Relation
+from .modulation import NeuromodSignal
 
 
 # ── Concept space (grid-located concepts) ────────────────────────────────────
@@ -121,6 +122,26 @@ def sp_representations(sp, input_sdrs: dict[str, np.ndarray]) -> dict[str, np.nd
     Convenience for grounding a ConceptSpace in Spatial Pooler representations."""
     return {name: sp.compute(np.asarray(inp), learn=False)
             for name, inp in input_sdrs.items()}
+
+
+def ground_model(model, tokens: list[str] | None = None, n_axes: int = 2,
+                 span: int = 24, seed: int = 0) -> ConceptSpace:
+    """Ground a ConceptSpace in a **corpus-trained** HierarchicalCLM.
+
+    Uses level-0 unit 0's representation for each token — with a Spatial Pooler
+    these are the *learned* SDRs, otherwise the semantic fingerprints.  The
+    resulting knowledge space, its axes, and its metric are therefore discovered
+    from the corpus the model was actually trained on (real vocabulary), not
+    from synthetic inputs.
+    """
+    model._build()
+    unit = model.levels[0].units[0]
+    if tokens is None:
+        tokens = list(unit._token_sdr) or (
+            list(unit.enc.vocab) if unit.enc is not None else [])
+    reps = {t: unit._sdr(t) for t in tokens}
+    space = ConceptSpace(n_axes=n_axes, dim=model.col_dim, seed=seed)
+    return space.ground(reps, span=span)
 
 
 # ── Reasoning as movement (transitive inference) ─────────────────────────────
@@ -234,19 +255,48 @@ class ReasoningPolicy:
     """Value over relations, reinforced by successful plans — the RL/survival
     loop: moves that reach reward are preferred next time.  Steers which
     relations the planner expands first (it never changes what is *reachable*,
-    only the search order / efficiency)."""
+    only the search order / efficiency).
 
-    def __init__(self, relations: RelationSet, lr: float = 0.5):
+    Neuromodulatory coupling (end-to-end active inference): pass the temporal
+    memory's `NeuromodSignal` and the policy shares the brain's dopamine loop —
+    a *solved* plan is low-surprise (predicted), a *failure* is high-surprise
+    (burst), and the signal's current modulation *gates* how strongly the policy
+    learns (dopamine gates plasticity), exactly as it gates column plasticity.
+    """
+
+    def __init__(self, relations: RelationSet, lr: float = 0.5,
+                 neuromod: NeuromodSignal | None = None):
         self.lr = lr
         self.value = {name: 1.0 for name in relations.names()}
+        self.neuromod = neuromod
 
-    def reinforce(self, result: dict, reward: float = 1.0) -> None:
-        for name in set(result.get("chain", ())):
-            self.value[name] += self.lr * reward
+    def reinforce(self, result: dict | None, reward: float = 1.0) -> None:
+        gate = 1.0
+        if self.neuromod is not None:
+            # reward>0 = goal reached (predicted); reward<=0 = failure (surprise)
+            self.neuromod.update(burst=(reward <= 0))
+            gate = self.neuromod.modulation
+        for name in set((result or {}).get("chain", ())):
+            self.value[name] += self.lr * gate * reward
 
     def ordered(self, relations: RelationSet) -> list[tuple]:
         return sorted(relations.items(),
                       key=lambda kv: -self.value.get(kv[0], 1.0))
+
+
+def active_infer(space: ConceptSpace, start: str, goal: str,
+                 relations: RelationSet, policy: ReasoningPolicy,
+                 max_depth: int = 12) -> dict:
+    """One end-to-end active-inference cycle over the knowledge space.
+
+    Plan toward the goal, evaluate the outcome as reward (prediction-error
+    reduction: reaching the goal is rewarding, shorter paths more so; failure is
+    punishing and drives surprise/plasticity up), then reinforce the policy with
+    neuromodulatory gating.  Returns {'result', 'reward'}."""
+    result = plan(space, start, goal, relations, policy=policy, max_depth=max_depth)
+    reward = (1.0 / len(result["chain"])) if (result and result["chain"]) else -1.0
+    policy.reinforce(result, reward)
+    return {"result": result, "reward": reward}
 
 
 # ── Analogy (displacement transfer) ──────────────────────────────────────────

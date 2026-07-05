@@ -17,9 +17,12 @@ from core.displacement import GridSpace, Relation
 from core.reasoning import (
     ConceptSpace, walk, infer_relation, analogy, SentenceSpace,
     RelationSet, plan, explain, ReasoningPolicy, sp_representations,
+    ground_model, active_infer,
 )
 from core.displacement import Relation
 from core.spatial_pooler import SpatialPooler
+from core.modulation import NeuromodSignal
+from core.hierarchy import HierarchicalCLM
 
 
 # ── Structured-SDR fixture: two orthogonal latent factors ────────────────────
@@ -225,6 +228,50 @@ def test_ground_from_spatial_pooler_preserves_similarity():
         grounded_nearest = min(others, key=lambda c: _coord_dist(space, anchor, c))
         assert grounded_nearest == sp_nearest, (
             f"{anchor}: SP-nearest {sp_nearest} but grounded-nearest {grounded_nearest}")
+
+
+# ── Milestone 5: grounding from a corpus-trained model ───────────────────────
+
+def test_ground_from_trained_model():
+    """A ConceptSpace grounded in a corpus-trained CLM's learned SDRs covers the
+    real vocabulary and yields valid coordinates."""
+    seqs = [["the", "cat", "sat"], ["the", "dog", "ran"],
+            ["a", "cat", "ran"], ["a", "dog", "sat"]] * 8
+    model = HierarchicalCLM(n_levels=1, strides=(1,), n_units=1, col_dim=512,
+                            cells_per_col=4, encoder="semantic", dim=512,
+                            fp_bits=21, index_bits=7, activation_threshold=5,
+                            syn_per_seg=12, max_segs=8, use_spatial_pooler=True)
+    model.fit_encoders(seqs)
+    model.train(seqs, epochs=2)
+
+    space = ground_model(model, n_axes=2)
+    vocab = set(model.levels[0].units[0]._token_sdr)
+    assert set(space.coord) == vocab and len(vocab) >= 5
+    # coordinates are integer grid points inside the span
+    for c in space.coord.values():
+        assert c.shape == (2,) and (c >= 0).all()
+
+
+# ── Milestone 6: neuromodulatory active inference ────────────────────────────
+
+def test_neuromod_coupling_and_active_inference():
+    space = _royalty_space()
+    rels = _royalty_relations(space)
+    nm = NeuromodSignal()
+    policy = ReasoningPolicy(rels, neuromod=nm)
+
+    # Success: goal reachable → positive reward, policy values rise, low surprise
+    before = dict(policy.value)
+    cyc = active_infer(space, "man", "queen", rels, policy)
+    assert cyc["result"] is not None and cyc["reward"] > 0
+    assert any(policy.value[n] > before[n] for n in cyc["result"]["chain"])
+    assert nm.modulation <= 1.0                      # predicted → consolidating
+
+    # Failure: unreachable goal → negative reward drives surprise/plasticity up
+    space.place("island", (9, 9))                    # placed but no relation reaches it
+    fail = active_infer(space, "man", "island", rels, policy)
+    assert fail["result"] is None and fail["reward"] < 0
+    assert nm.modulation > 0.2                        # surprise raised plasticity
 
 
 # ── Milestone 3: VSA recovers structure raw SDR loses ────────────────────────

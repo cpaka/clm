@@ -14,8 +14,8 @@ and passing their falsifiable milestone tests (§6):
 |---|---|
 | `core/vsa.py` | bind / unbind / bundle / permute / similarity, `RoleBook`, `Codebook` (cleanup) |
 | `core/displacement.py` | `GridSpace` (N-axis grid), `Relation` (learned displacement, compose) |
-| `core/reasoning.py` | `ConceptSpace` (+ `ground`), `walk` / `infer_relation` (transitive), `analogy`, `SentenceSpace` (SVO), `plan` / `RelationSet` / `ReasoningPolicy` (goal-steered walk), `sp_representations` |
-| `tests/test_reasoning.py` | 14 tests: bind/unbind, transitive generalisation, analogy, VSA-beats-raw-union, multi-relation planning, predator avoidance, policy steering, grounding recovers structure, SP→grounding preserves similarity |
+| `core/reasoning.py` | `ConceptSpace` (+ `ground`), `walk` / `infer_relation` (transitive), `analogy`, `SentenceSpace` (SVO), `plan` / `RelationSet` / `ReasoningPolicy` (goal-steered walk), `sp_representations`, `ground_model` (corpus-trained CLM → space), `active_infer` (neuromod-coupled cycle) |
+| `tests/test_reasoning.py` | 16 tests: bind/unbind, transitive generalisation, analogy, VSA-beats-raw-union, multi-relation planning, predator avoidance, policy steering, grounding recovers structure, SP→grounding preserves similarity, grounding from a trained model, neuromodulatory active inference |
 
 Run: `python -m tests.test_reasoning` (12/12 passing). Verified milestones:
 transitive inference generalises to **unseen** distances from adjacent-only
@@ -37,11 +37,19 @@ A useful honest finding: reasoning quality is bounded by representation quality 
 a lightly-trained SP captured the dominant factor and collapsed a weaker one, so
 the grounded space reflected exactly what the SP had learned (no more, no less).
 
+**Corpus grounding + active inference (DONE):** `ground_model(model)` grounds a
+ConceptSpace directly in a **corpus-trained** HierarchicalCLM's learned SDRs
+(real vocabulary from the deployed v5.0 Spatial Pooler), not synthetic inputs.
+`ReasoningPolicy(neuromod=...)` + `active_infer()` close the end-to-end
+active-inference loop: a plan's success/failure feeds the temporal memory's
+`NeuromodSignal` (solved = predicted, failed = burst), and that dopamine signal
+*gates* how strongly the policy learns — the same signal that gates column
+plasticity. Reasoning and perception now share one neuromodulatory loop.
+
 **Next (not yet built):** scale from toy concept spaces + SVO triples toward
-dependency-parsed language; drive grounding from the *corpus-trained* Spatial
-Pooler (deployed in v5.0) rather than synthetic inputs; and couple the reward in
-`ReasoningPolicy` to the temporal memory's `NeuromodSignal` for end-to-end
-active inference.
+dependency-parsed language; learn *relations* from corpus co-occurrence (not
+hand-specified pairs); and richer reward shaping (goal-distance + path cost) in
+the active-inference cycle.
 
 ---
 

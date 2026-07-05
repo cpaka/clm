@@ -78,6 +78,7 @@ HTM temporal memory, and hierarchical cortical columns.</p>
   <a href="#scaleup">8. How the model improves</a>
   <a href="#gpu">9. GPU acceleration (V4)</a>
   <a href="#params">10. Key hyperparameters</a>
+  <a href="#reasoning">11. Reasoning layer (SDR + VSA)</a>
 </nav>
 
 <!-- ═══════════════════════════════════════════════════════════════════ -->
@@ -520,6 +521,68 @@ to the small candidate arrays, not the full weight matrices.</p>
   <code>n_cells × max_segs × syn_per_seg × 8 bytes</code> (idx + perm) =
   <code>4096 × 8 × 12 × 8</code> = <strong>~3 MB per unit</strong>.
   Three units + two levels = ~19 MB total.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<h2 id="reasoning">11. Reasoning Layer (SDR + VSA)</h2>
+
+<p>A thin layer on top of the cortical core (no core changes) treats
+<em>reasoning as movement through a knowledge space</em> — the grid-cell
+reference frame reused for abstract thought.  It rests on a clean split:
+<strong>SDR is the representation</strong> (the noun); <strong>VSA — Vector
+Symbolic Architecture — is the algebra run on SDRs</strong> (the verbs) that lets
+them carry <em>structure</em>, not just sets.</p>
+
+<h3>Why VSA on top of SDR</h3>
+<p>Raw SDRs give only similarity (overlap) and sets.  A set loses structure:
+<code>union(cat, on, mat)</code> equals <code>union(mat, on, cat)</code>, so
+"cat on mat" and "mat on cat" collide (the binding problem).  VSA fixes it with
+sparsity-preserving <strong>permutation binding</strong>:</p>
+<pre>
+sentence = bundle( bind(SUBJECT, cat), bind(RELATION, on), bind(OBJECT, mat) )
+unbind(SUBJECT, sentence)  →  cat        <span class="g">// structure recoverable</span>
+</pre>
+
+<h3>Operations (<code>core/vsa.py</code>)</h3>
+<ul>
+  <li><strong>bind / unbind</strong> — attach / recover a filler to a role (permutation; keeps ~w sparsity)</li>
+  <li><strong>bundle</strong> — superpose a set (union + k-WTA re-sparsify)</li>
+  <li><strong>permute</strong> — sequence position (ρⁿ)</li>
+  <li><strong>Codebook cleanup</strong> — snap a noisy result to the nearest stored symbol</li>
+</ul>
+
+<h3>Reasoning as movement (<code>core/displacement.py</code>, <code>core/reasoning.py</code>)</h3>
+<p>A knowledge space is an N-axis grid; a <strong>relation is a displacement</strong>
+(a constant move).  Because grid codes compose by addition, relations learned
+from a few local examples generalise:</p>
+<pre>
+D(A→B) then D(B→C)  ==  D(A→C)        <span class="g">// transitive inference for free</span>
+analogy:  king − man + woman  →  queen   <span class="g">// displacement transfer + cleanup</span>
+plan(man → queen):  man --make_royal--> king --make_female--> queen
+</pre>
+<p><code>plan()</code> is a goal-directed beam search that chains different
+relations (multi-step inference) and supports <code>avoid</code> (the
+predator/prey survival loop).  <code>ReasoningPolicy</code> learns which moves pay
+off, and — coupled to the temporal memory's <code>NeuromodSignal</code> — closes
+an end-to-end <strong>active-inference</strong> loop: a solved plan is
+low-surprise, a failure high-surprise, and that dopamine signal gates how
+strongly the policy learns, exactly as it gates column plasticity.</p>
+
+<div class="callout green">
+  <strong>Grounded in learned representations.</strong>
+  <code>ground_model(model)</code> discovers the space's coordinates directly from
+  a <em>corpus-trained</em> Spatial Pooler's learned SDRs (real vocabulary) — the
+  axes and metric are learned from data, not hand-placed.  Honest caveat:
+  reasoning quality is bounded by representation quality; a weak representation
+  yields a weak space.
+</div>
+
+<div class="callout">
+  <strong>Status:</strong> implemented and tested (<code>python -m
+  tests.test_reasoning</code>, 16/16).  This is a research frontier — the pieces
+  (VSA algebra, grid codes, active inference) are solid, but assembling them into
+  a general reasoning engine is a multi-year bet, pursued via small falsifiable
+  milestones.  See <code>REASONING.md</code> for the full roadmap.
 </div>
 
 </div><!-- /page -->

@@ -16,9 +16,31 @@ from core.vsa import RoleBook, Codebook, bind, unbind, bundle, permute, similari
 from core.displacement import GridSpace, Relation
 from core.reasoning import (
     ConceptSpace, walk, infer_relation, analogy, SentenceSpace,
-    RelationSet, plan, explain, ReasoningPolicy,
+    RelationSet, plan, explain, ReasoningPolicy, sp_representations,
 )
 from core.displacement import Relation
+from core.spatial_pooler import SpatialPooler
+
+
+# ── Structured-SDR fixture: two orthogonal latent factors ────────────────────
+
+def _factored_sdrs(dim=600, seed=0):
+    """Concepts built from two latent factors (gender, royalty) on disjoint bit
+    blocks, plus a unique identity block — a controlled space with known linear
+    structure to test that grounding recovers it.  The factors have different
+    sizes (gender > royalty) so the structure is non-degenerate, as any real
+    learned representation is."""
+    rng = np.random.default_rng(seed)
+    G0, G1 = np.arange(0, 45), np.arange(45, 90)        # gender: male / female
+    R0, R1 = np.arange(90, 110), np.arange(110, 130)    # royalty: commoner / royal
+    def ident():
+        return rng.choice(np.arange(130, dim), 8, replace=False)
+    def make(g, r):
+        return np.sort(np.concatenate([g, r, ident()])).astype(np.int32)
+    return {
+        "man":   make(G0, R0), "woman": make(G1, R0),
+        "king":  make(G0, R1), "queen": make(G1, R1),
+    }
 
 
 # ── VSA primitives ───────────────────────────────────────────────────────────
@@ -158,6 +180,51 @@ def test_policy_reinforcement_steers():
     # Relations that were used gain value; the loop learns which moves pay off.
     for name in res["chain"]:
         assert policy.value[name] > before[name]
+
+
+# ── Milestone 4: coordinates GROUNDED in learned representations ─────────────
+
+def _coord_dist(space, a, b):
+    return int(np.abs(space.coord[a] - space.coord[b]).sum())
+
+
+def test_ground_recovers_latent_structure():
+    """Coordinates discovered from structured SDRs (not hand-placed) recover the
+    two latent factors, so displacement analogy works on learned coordinates."""
+    sdrs = _factored_sdrs()
+    space = ConceptSpace(n_axes=2, dim=600, seed=0).ground(sdrs)
+    # queen shares no factor with man → it must be the farthest concept
+    dists = {c: _coord_dist(space, "man", c) for c in ("woman", "king", "queen")}
+    assert dists["queen"] == max(dists.values())
+    # analogy on the LEARNED coordinates
+    assert analogy(space, "man", "king", "woman") == "queen"
+
+
+def test_ground_from_spatial_pooler_preserves_similarity():
+    """Full pipeline: structured inputs → Spatial Pooler learned SDRs → grounded
+    coordinates.  Grounding preserves the learned *nearest neighbour*: whatever
+    the SP decides is most similar to a concept ends up closest in coordinate
+    space.  (Which factors the SP captures is its own business — the point is
+    that the coordinates reflect the *learned* representation, not hand-placed
+    structure.)"""
+    from core.sdr import overlap
+    inputs = _factored_sdrs(dim=600, seed=1)
+    sp = SpatialPooler(input_dim=600, col_dim=512, active_cols=21, seed=0)
+    for _ in range(20):                                   # fit
+        for s in inputs.values():
+            sp.compute(s, learn=True)
+    sp.freeze()
+
+    reps = sp_representations(sp, inputs)
+    assert all(r.size == 21 for r in reps.values())       # learned SDRs
+    space = ConceptSpace(n_axes=2, dim=512, seed=0).ground(reps)
+
+    for anchor in inputs:
+        others = [c for c in inputs if c != anchor]
+        sp_nearest = max(others, key=lambda c: overlap(reps[anchor], reps[c]))
+        grounded_nearest = min(others, key=lambda c: _coord_dist(space, anchor, c))
+        assert grounded_nearest == sp_nearest, (
+            f"{anchor}: SP-nearest {sp_nearest} but grounded-nearest {grounded_nearest}")
 
 
 # ── Milestone 3: VSA recovers structure raw SDR loses ────────────────────────

@@ -43,6 +43,7 @@ class ConceptSpace:
         self.coord: dict[str, np.ndarray] = {}
         self._feat: dict[str, np.ndarray] = {}
         self._loc = Codebook()                    # location SDR → concept
+        self._exact = True                        # exact cleanup unless grounded
 
     def place(self, concept: str, coord) -> None:
         self.coord[concept] = np.atleast_1d(coord).astype(np.int64)
@@ -55,9 +56,13 @@ class ConceptSpace:
             ).astype(np.int32)
         return self._feat[concept]
 
-    def at(self, coord, exact: bool = True) -> str | None:
+    def at(self, coord, exact: bool | None = None) -> str | None:
         """Concept located at `coord`, via SDR cleanup.  With `exact`, requires a
-        full-overlap match (the coordinate is actually occupied)."""
+        full-overlap match (the coordinate is actually occupied); grounded spaces
+        default to nearest-match (`exact=False`) since learned coordinates can
+        collide.  `exact=None` uses the space's default."""
+        if exact is None:
+            exact = self._exact
         sdr = self.grid.sdr(coord)
         hit = self._loc.cleanup(sdr, topn=1)
         if not hit:
@@ -71,6 +76,51 @@ class ConceptSpace:
         """Learn a displacement relation from (source, target) concept pairs."""
         pairs = [(self.coord[a], self.coord[b]) for a, b in example_pairs]
         return Relation(self.grid).fit(pairs)
+
+    def ground(self, concept_sdrs: dict[str, np.ndarray], span: int = 24) -> "ConceptSpace":
+        """Discover grid coordinates FROM learned SDRs instead of hand-placing.
+
+        Given a learned representation per concept (e.g. Spatial Pooler outputs),
+        embed their similarity structure onto the top-`n_axes` principal
+        directions (SVD) and discretise each axis to the grid.  Concepts that are
+        similar in the learned SDR space land at nearby coordinates — so the
+        knowledge space, its axes, and its metric are *learned from data* rather
+        than assigned.  Each concept's feature SDR becomes its learned SDR.
+
+        (SVD gives a deterministic global-linear embedding; a self-organising map
+        would be a more biologically literal topographic alternative.)
+        """
+        names = list(concept_sdrs)
+        n_axes = self.grid.n_axes
+        X = np.zeros((len(names), self.dim), dtype=np.float32)
+        for i, name in enumerate(names):
+            X[i, np.asarray(concept_sdrs[name], dtype=int)] = 1.0
+        Xc = X - X.mean(axis=0, keepdims=True)
+        U, S, _ = np.linalg.svd(Xc, full_matrices=False)
+        proj = U[:, :n_axes] * S[:n_axes]                    # (n, n_axes)
+
+        # Reset placement and re-place from the learned embedding.
+        self.coord.clear()
+        self._feat.clear()
+        self._loc = Codebook()
+        self._exact = False
+        for i, name in enumerate(names):
+            coord = []
+            for a in range(n_axes):
+                col = proj[:, a]
+                lo, hi = float(col.min()), float(col.max())
+                c = 0 if hi == lo else int(round((proj[i, a] - lo) / (hi - lo) * (span - 1)))
+                coord.append(c)
+            self.place(name, coord)
+            self._feat[name] = np.asarray(concept_sdrs[name], dtype=np.int32)
+        return self
+
+
+def sp_representations(sp, input_sdrs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Map inputs → learned Spatial-Pooler output SDRs (sp should be fit+frozen).
+    Convenience for grounding a ConceptSpace in Spatial Pooler representations."""
+    return {name: sp.compute(np.asarray(inp), learn=False)
+            for name, inp in input_sdrs.items()}
 
 
 # ── Reasoning as movement (transitive inference) ─────────────────────────────

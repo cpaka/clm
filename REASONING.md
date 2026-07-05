@@ -14,8 +14,8 @@ and passing their falsifiable milestone tests (§6):
 |---|---|
 | `core/vsa.py` | bind / unbind / bundle / permute / similarity, `RoleBook`, `Codebook` (cleanup) |
 | `core/displacement.py` | `GridSpace` (N-axis grid), `Relation` (learned displacement, compose) |
-| `core/reasoning.py` | `ConceptSpace`, `walk` / `infer_relation` (transitive), `analogy`, `SentenceSpace` (SVO), `plan` / `RelationSet` / `ReasoningPolicy` (goal-steered walk) |
-| `tests/test_reasoning.py` | 12 tests: bind/unbind, transitive generalisation, analogy, VSA-beats-raw-union, multi-relation planning, predator avoidance, policy steering |
+| `core/reasoning.py` | `ConceptSpace` (+ `ground`), `walk` / `infer_relation` (transitive), `analogy`, `SentenceSpace` (SVO), `plan` / `RelationSet` / `ReasoningPolicy` (goal-steered walk), `sp_representations` |
+| `tests/test_reasoning.py` | 14 tests: bind/unbind, transitive generalisation, analogy, VSA-beats-raw-union, multi-relation planning, predator avoidance, policy steering, grounding recovers structure, SP→grounding preserves similarity |
 
 Run: `python -m tests.test_reasoning` (12/12 passing). Verified milestones:
 transitive inference generalises to **unseen** distances from adjacent-only
@@ -26,11 +26,22 @@ goal-steered `plan()` chains **different** relations to reach a goal
 predator** (the survival/avoidance loop) via best-first search over the grid
 frame's own distance metric.
 
+**Grounding in learned representations (DONE):** `ConceptSpace.ground()` now
+discovers grid coordinates directly from learned SDRs (e.g. Spatial Pooler
+outputs, via `sp_representations`) by embedding their similarity structure onto
+principal axes and discretising to the grid — so the space, its axes, and its
+metric are *learned from data*, not hand-placed.  Verified: grounding recovers
+latent factors well enough for analogy on learned coordinates, and the full
+input→SpatialPooler→grounding pipeline preserves the learned nearest neighbour.
+A useful honest finding: reasoning quality is bounded by representation quality —
+a lightly-trained SP captured the dominant factor and collapsed a weaker one, so
+the grounded space reflected exactly what the SP had learned (no more, no less).
+
 **Next (not yet built):** scale from toy concept spaces + SVO triples toward
-dependency-parsed language; ground the concept coordinates in *learned* Spatial
-Pooler representations (so the space is discovered from data, not hand-placed);
-and couple the reward in `ReasoningPolicy` to the temporal memory's
-`NeuromodSignal` for end-to-end active inference.
+dependency-parsed language; drive grounding from the *corpus-trained* Spatial
+Pooler (deployed in v5.0) rather than synthetic inputs; and couple the reward in
+`ReasoningPolicy` to the temporal memory's `NeuromodSignal` for end-to-end
+active inference.
 
 ---
 

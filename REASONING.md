@@ -14,17 +14,23 @@ and passing their falsifiable milestone tests (§6):
 |---|---|
 | `core/vsa.py` | bind / unbind / bundle / permute / similarity, `RoleBook`, `Codebook` (cleanup) |
 | `core/displacement.py` | `GridSpace` (N-axis grid), `Relation` (learned displacement, compose) |
-| `core/reasoning.py` | `ConceptSpace`, `walk` / `infer_relation` (transitive), `analogy`, `SentenceSpace` (SVO) |
-| `tests/test_reasoning.py` | 8 tests: bind/unbind, transitive generalisation, analogy, VSA-beats-raw-union |
+| `core/reasoning.py` | `ConceptSpace`, `walk` / `infer_relation` (transitive), `analogy`, `SentenceSpace` (SVO), `plan` / `RelationSet` / `ReasoningPolicy` (goal-steered walk) |
+| `tests/test_reasoning.py` | 12 tests: bind/unbind, transitive generalisation, analogy, VSA-beats-raw-union, multi-relation planning, predator avoidance, policy steering |
 
-Run: `python -m tests.test_reasoning` (8/8 passing). Verified milestones:
+Run: `python -m tests.test_reasoning` (12/12 passing). Verified milestones:
 transitive inference generalises to **unseen** distances from adjacent-only
-training; `man:king :: woman:queen` by displacement transfer; and VSA keeps
-"cat chased mouse" ≠ "mouse chased cat" where raw SDR union collapses them.
+training; `man:king :: woman:queen` by displacement transfer; VSA keeps
+"cat chased mouse" ≠ "mouse chased cat" where raw SDR union collapses them; and
+goal-steered `plan()` chains **different** relations to reach a goal
+(`man --make_royal--> king --make_female--> queen`) and routes **around a
+predator** (the survival/avoidance loop) via best-first search over the grid
+frame's own distance metric.
 
-**Next (not yet built):** the active-inference *walk with value/goal steering*
-over learned relations (beam search + `NeuromodSignal` reward), and scaling from
-toy concept spaces + SVO triples toward dependency-parsed language.
+**Next (not yet built):** scale from toy concept spaces + SVO triples toward
+dependency-parsed language; ground the concept coordinates in *learned* Spatial
+Pooler representations (so the space is discovered from data, not hand-placed);
+and couple the reward in `ReasoningPolicy` to the temporal memory's
+`NeuromodSignal` for end-to-end active inference.
 
 ---
 

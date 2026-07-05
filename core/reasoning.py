@@ -101,6 +101,104 @@ def infer_relation(space: ConceptSpace, a: str, b: str, relation: Relation,
     return (len(path) - 1) if path and path[-1] == b else None
 
 
+# ── Goal-steered reasoning (planning as movement) ────────────────────────────
+
+class RelationSet:
+    """A named set of relations available as reasoning moves."""
+
+    def __init__(self):
+        self._r: dict[str, Relation] = {}
+
+    def add(self, name: str, relation: Relation) -> "RelationSet":
+        self._r[name] = relation
+        return self
+
+    def items(self):
+        return self._r.items()
+
+    def names(self) -> list[str]:
+        return list(self._r)
+
+
+def plan(space: ConceptSpace, start: str, goal: str, relations: RelationSet,
+         beam: int = 16, max_depth: int = 12,
+         avoid: set[str] | None = None,
+         policy: "ReasoningPolicy | None" = None) -> dict | None:
+    """Goal-directed beam search: find a chain of relations from `start` to
+    `goal`, combining DIFFERENT relations across steps (multi-step inference).
+
+    Steered by the reference frame's own metric — states are expanded
+    best-first by Manhattan distance to the goal in grid-coordinate space (grid
+    cells encode distance, so this is reading the frame, not cheating).  `avoid`
+    is the survival loop: never enter those concepts (predators).  An optional
+    `policy` orders which relations to try first (learned value steering).
+
+    Returns {'chain': [relation names], 'path': [concepts]} or None.
+    """
+    goal_c = np.atleast_1d(space.coord[goal]).astype(np.int64)
+    avoid = set(avoid or ())
+
+    def dist(coord) -> int:
+        return int(np.abs(np.atleast_1d(coord).astype(np.int64) - goal_c).sum())
+
+    rel_items = (policy.ordered(relations) if policy else list(relations.items()))
+
+    start_c = space.coord[start].copy()
+    frontier = [(start_c, [], [start])]
+    seen = {tuple(int(x) for x in start_c)}
+
+    for _ in range(max_depth):
+        cand: list[tuple] = []
+        for coord, chain, path in frontier:
+            for rname, rel in rel_items:
+                nc = rel.apply(coord)
+                key = tuple(int(x) for x in nc)
+                if key in seen:
+                    continue
+                name = space.at(nc)
+                if name is None or name in avoid:
+                    continue
+                seen.add(key)
+                npath, nchain = path + [name], chain + [rname]
+                if name == goal:
+                    return {"chain": nchain, "path": npath}
+                cand.append((dist(nc), nc, nchain, npath))
+        if not cand:
+            break
+        cand.sort(key=lambda x: x[0])                     # nearest to goal first
+        frontier = [(c, ch, p) for _, c, ch, p in cand[:beam]]
+    return None
+
+
+def explain(result: dict) -> str:
+    """Render a plan as a human-readable reasoning trace."""
+    if not result:
+        return "(no path found)"
+    parts = [result["path"][0]]
+    for rel, concept in zip(result["chain"], result["path"][1:]):
+        parts += [f"--{rel}-->", concept]
+    return " ".join(parts)
+
+
+class ReasoningPolicy:
+    """Value over relations, reinforced by successful plans — the RL/survival
+    loop: moves that reach reward are preferred next time.  Steers which
+    relations the planner expands first (it never changes what is *reachable*,
+    only the search order / efficiency)."""
+
+    def __init__(self, relations: RelationSet, lr: float = 0.5):
+        self.lr = lr
+        self.value = {name: 1.0 for name in relations.names()}
+
+    def reinforce(self, result: dict, reward: float = 1.0) -> None:
+        for name in set(result.get("chain", ())):
+            self.value[name] += self.lr * reward
+
+    def ordered(self, relations: RelationSet) -> list[tuple]:
+        return sorted(relations.items(),
+                      key=lambda kv: -self.value.get(kv[0], 1.0))
+
+
 # ── Analogy (displacement transfer) ──────────────────────────────────────────
 
 def analogy(space: ConceptSpace, a: str, b: str, c: str) -> str | None:

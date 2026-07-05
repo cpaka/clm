@@ -14,7 +14,11 @@ import numpy as np
 
 from core.vsa import RoleBook, Codebook, bind, unbind, bundle, permute, similarity
 from core.displacement import GridSpace, Relation
-from core.reasoning import ConceptSpace, walk, infer_relation, analogy, SentenceSpace
+from core.reasoning import (
+    ConceptSpace, walk, infer_relation, analogy, SentenceSpace,
+    RelationSet, plan, explain, ReasoningPolicy,
+)
+from core.displacement import Relation
 
 
 # ── VSA primitives ───────────────────────────────────────────────────────────
@@ -93,6 +97,67 @@ def test_analogy_king_queen():
     assert analogy(space, "man", "king", "woman") == "queen"     # +royal
     assert analogy(space, "man", "woman", "king") == "queen"     # +female
     assert analogy(space, "king", "man", "queen") == "woman"     # -royal
+
+
+# ── Milestone 2b: goal-steered planning (multi-step, multi-relation) ─────────
+
+def _royalty_relations(space):
+    rels = RelationSet()
+    rels.add("make_royal", space.learn_relation([("man", "king")]))    # (0,+1)
+    rels.add("make_female", space.learn_relation([("man", "woman")]))  # (+1,0)
+    return rels
+
+
+def test_plan_combines_relations():
+    """Reach a goal that needs TWO different relations chained — real multi-step
+    inference, not repetition of one move."""
+    space = _royalty_space()
+    rels = _royalty_relations(space)
+    res = plan(space, "man", "queen", rels)
+    assert res is not None and res["path"][-1] == "queen"
+    assert len(res["chain"]) == 2
+    assert set(res["chain"]) == {"make_royal", "make_female"}
+
+
+def test_plan_transitive_chain():
+    space = ConceptSpace(n_axes=1, dim=1024, w=21, seed=0)
+    for i, it in enumerate("abcdef"):
+        space.place(it, i)
+    rels = RelationSet().add("succ", space.learn_relation([("a", "b")]))
+    res = plan(space, "a", "f", rels)
+    assert res["path"] == ["a", "b", "c", "d", "e", "f"]
+    assert res["chain"] == ["succ"] * 5
+
+
+def test_plan_avoids_predator():
+    """Survival loop: route from prey-hunter start to prey, avoiding a predator
+    sitting on the direct lattice path."""
+    space = ConceptSpace(n_axes=2, dim=1024, w=21, seed=0)
+    grid = {}
+    for x in range(3):
+        for y in range(3):
+            name = f"c{x}{y}"
+            space.place(name, (x, y))
+            grid[(x, y)] = name
+    rels = RelationSet()
+    rels.add("east", Relation(space.grid, [1, 0]))
+    rels.add("north", Relation(space.grid, [0, 1]))
+    predator = grid[(1, 1)]
+    res = plan(space, "c00", "c22", rels, avoid={predator})
+    assert res is not None and res["path"][-1] == "c22"
+    assert predator not in res["path"], "path must avoid the predator"
+
+
+def test_policy_reinforcement_steers():
+    space = _royalty_space()
+    rels = _royalty_relations(space)
+    policy = ReasoningPolicy(rels)
+    before = dict(policy.value)
+    res = plan(space, "man", "queen", rels, policy=policy)
+    policy.reinforce(res, reward=1.0)
+    # Relations that were used gain value; the loop learns which moves pay off.
+    for name in res["chain"]:
+        assert policy.value[name] > before[name]
 
 
 # ── Milestone 3: VSA recovers structure raw SDR loses ────────────────────────

@@ -63,22 +63,48 @@ DOCS_HTML = r"""<!DOCTYPE html>
 <a href="/" class="back">← back to playground</a>
 
 <h1>Cortical Language Model — Architecture</h1>
-<p style="color:var(--muted)">A brain-inspired language model using Sparse Distributed Representations,
-HTM temporal memory, and hierarchical cortical columns.</p>
+<p style="color:var(--muted)">A language model that learns the way a brain does — no backpropagation,
+no dense matrix multiplications, no GPU required. Every signal is a small pattern of "on" switches
+(a Sparse Distributed Representation), and the model learns by strengthening connections between
+patterns that occur together.</p>
+
+<div class="callout">
+  <strong>New here?</strong> Read this page top to bottom for the whole system in plain language —
+  no neuroscience or machine-learning background assumed. In one paragraph: every concept is a wide
+  row of switches with only ~1&nbsp;% on (§1); a <em>Spatial Pooler</em> learns those representations
+  (§2) and a <em>Semantic Encoder</em> gives each word a fingerprint (§3); a <em>cortical column</em>
+  learns sequences by trying to predict the next pattern and growing new connections when it is
+  surprised (§4–5); surprise gates learning and triggers replay (§6); columns are stacked into a
+  hierarchy (§7) and vote as an ensemble (§8); and a reasoning layer treats concepts as places and
+  relations as moves through a knowledge space (§12).
+</div>
+
+<div class="callout green">
+  <strong>Built on four papers</strong> from Jeff Hawkins and colleagues (Numenta / the Thousand
+  Brains Project):
+  <ul style="margin:0.4rem 0 0">
+    <li><strong>Hawkins &amp; Ahmad, 2016</strong> — sequence memory in one column → <code>core/column.py</code></li>
+    <li><strong>Hawkins, Ahmad &amp; Cui, 2017</strong> — a column's stable "output layer" → <code>core/pooling.py</code></li>
+    <li><strong>Hawkins et al., 2019</strong> — grid-cell reference frames for concepts → reasoning layer</li>
+    <li><strong>Leadholm, Clay et al., 2025</strong> — Thousand Brains voting systems → the ensemble</li>
+  </ul>
+</div>
 
 <nav>
   <strong style="color:var(--text)">Contents</strong>
   <a href="#sdr">1. Sparse Distributed Representations</a>
-  <a href="#encoder">2. Semantic Encoder — words as fingerprints</a>
-  <a href="#column">3. Cortical Column — learning sequences</a>
-  <a href="#sequence">4. How sequences are learned step-by-step</a>
-  <a href="#neuromod">5. Neuromodulation &amp; replay</a>
-  <a href="#hierarchy">6. Hierarchical architecture</a>
-  <a href="#ensemble">7. Voting ensemble</a>
-  <a href="#scaleup">8. How the model improves</a>
-  <a href="#gpu">9. GPU acceleration (V4)</a>
-  <a href="#params">10. Key hyperparameters</a>
-  <a href="#reasoning">11. Reasoning layer (SDR + VSA)</a>
+  <a href="#pooler">2. Spatial Pooler — learned representations</a>
+  <a href="#encoder">3. Semantic Encoder — words as fingerprints</a>
+  <a href="#column">4. Cortical Column — learning sequences</a>
+  <a href="#sequence">5. How sequences are learned step-by-step</a>
+  <a href="#neuromod">6. Neuromodulation &amp; replay</a>
+  <a href="#hierarchy">7. Hierarchical architecture</a>
+  <a href="#ensemble">8. Voting ensemble</a>
+  <a href="#context">9. Context output layer (topic bias)</a>
+  <a href="#scaleup">10. How the model improves</a>
+  <a href="#gpu">11. GPU acceleration</a>
+  <a href="#params">12. Key hyperparameters</a>
+  <a href="#reasoning">13. Reasoning layer (SDR + VSA)</a>
 </nav>
 
 <!-- ═══════════════════════════════════════════════════════════════════ -->
@@ -117,7 +143,34 @@ representation has powerful mathematical properties that CLM exploits.</p>
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="encoder">2. Semantic Encoder — words as fingerprints</h2>
+<h2 id="pooler">2. Spatial Pooler — learning good representations</h2>
+
+<p>The encoder (§3) gives every word a first-draft fingerprint. The <strong>Spatial Pooler</strong>
+<em>improves</em> those fingerprints so that words used in similar ways come to share even more bits —
+it <strong>learns</strong> the representations instead of fixing them by hand. This is the
+"input-representation" half of HTM that pairs with the sequence-memory half in §4.</p>
+
+<pre>
+input fingerprint ──►  ┌─────────────── SpatialPooler ───────────────┐  ──► learned SDR
+                       │ each output mini-column owns a random pool  │
+                       │ of input bits with learned <em>permanences</em>      │
+                       │  • overlap  = # connected inputs that are on │
+                       │  • boosting = lift columns that fire rarely  │   (so no column dies —
+                       │  • k-WTA    = keep the top ~1% as the output │    representation stays
+                       │  • learn    = strengthen on active input,    │    <em>distributed</em>)
+                       │               weaken on inactive input       │
+                       └─────────────────────────────────────────────┘
+</pre>
+
+<div class="callout green">
+  <strong>Similar inputs end up sharing output bits</strong> — overlap is preserved <em>and sharpened</em>
+  by learning, so the output is a genuine learned distributed representation. The pooler is
+  <strong>fit once as preprocessing, then frozen and cached</strong>, so it adds nothing to the
+  training loop or to inference after fitting. Enabled via <code>use_spatial_pooler: True</code>.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<h2 id="encoder">3. Semantic Encoder — words as fingerprints</h2>
 
 <p>Every word gets a unique <em>fingerprint</em>: a 21-bit SDR within the 1024-bit space.
 The fingerprint has two parts:</p>
@@ -163,7 +216,7 @@ The fingerprint has two parts:</p>
 They are predicted with lower confidence but don't crash the model.</p>
 
 <!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="column">3. Cortical Column — learning sequences</h2>
+<h2 id="column">4. Cortical Column — learning sequences</h2>
 
 <p>Each CLM unit contains one <strong>CorticalColumn</strong> — an HTM temporal memory
 implemented as a fixed-size array of synaptic weights.
@@ -259,7 +312,7 @@ gather-and-reduce:</p>
 </ol>
 
 <!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="sequence">4. How sequences are learned step-by-step</h2>
+<h2 id="sequence">5. How sequences are learned step-by-step</h2>
 
 <p>Let's trace "the cat sat" through 20 training repetitions:</p>
 
@@ -309,7 +362,7 @@ are active, but which specific cells were chosen depends on context), the column
 implicitly encodes <em>context × word</em> transitions.</p>
 
 <!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="neuromod">5. Neuromodulation &amp; Hippocampal Replay</h2>
+<h2 id="neuromod">6. Neuromodulation &amp; Hippocampal Replay</h2>
 
 <h3>Neuromodulatory signal (dopamine-like)</h3>
 <p>The <code>NeuromodSignal</code> tracks the recent burst rate (fraction of surprised columns).
@@ -333,7 +386,7 @@ consolidation in biological learning — surprising episodes are rehearsed to
 strengthen long-term synaptic weights.</p>
 
 <!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="hierarchy">6. Hierarchical Architecture</h2>
+<h2 id="hierarchy">7. Hierarchical Architecture</h2>
 
 <pre>
 Input tokens:  the   cat   sat   on   a   mat
@@ -368,7 +421,7 @@ If enabled, each segment would become position-specific ("bigram at position 3")
 preventing generalisation. Disabled = position-agnostic predictions.</p>
 
 <!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="ensemble">7. Voting Ensemble (Thousand Brains Theory)</h2>
+<h2 id="ensemble">8. Voting Ensemble (Thousand Brains Theory)</h2>
 
 <pre>
 ┌─────────────────────────────────────────────────────────────┐
@@ -428,7 +481,32 @@ saved. This cuts wall-clock training time from <em>N × per-unit time</em> to
 <em>max(per-unit time)</em>.</p>
 
 <!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="scaleup">8. How the model improves</h2>
+<h2 id="context">9. Context Output Layer — a stable sense of topic</h2>
+
+<p>While the fast sequence memory (§4) tracks word-to-word transitions, a slow accumulator keeps a
+fuzzy running picture of <em>what this passage is about</em> and gently biases predictions toward
+words that fit. This is the "output layer" of the 2017 cortical-columns theory (Hawkins, Ahmad &amp;
+Cui): a fast input layer that senses the sequence, paired with a slow output layer that pools it
+into a stable object/topic representation which feeds back to sharpen predictions.</p>
+
+<pre>
+word ─► CorticalColumn (fast, changes every token)
+             │ active mini-columns
+             ▼
+        ContextPool (slow, decayed accumulator)
+             │ top-<em>pool_w</em> bits = a stable "topic" SDR
+             ▼
+   at decode: overlap(candidate fingerprint, topic SDR) = "does this word fit?"  ──► bias
+</pre>
+
+<div class="callout">
+  <strong>Cheap and training-free:</strong> <code>ContextPool</code> (<code>core/pooling.py</code>)
+  costs O(col_dim) per token — one decayed accumulate plus a top-<em>w</em> partition — and nothing
+  at training time. Higher <code>decay</code> = longer memory / slower-changing topic.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<h2 id="scaleup">10. How the model improves</h2>
 
 <h3>More data = more segments = wider vocabulary coverage</h3>
 <pre>
@@ -464,7 +542,7 @@ permanence) instead of being silently dropped, so recent data always lands.</p>
 </table>
 
 <!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="gpu">9. GPU Acceleration (V4)</h2>
+<h2 id="gpu">11. GPU Acceleration</h2>
 
 <p>The column hot path is a single gather-and-reduce over the synaptic weight arrays.
 This maps perfectly onto GPU SIMD execution:</p>
@@ -497,7 +575,7 @@ complex GPU random-number management. Device-to-host transfers are isolated
 to the small candidate arrays, not the full weight matrices.</p>
 
 <!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="params">10. Key Hyperparameters</h2>
+<h2 id="params">12. Key Hyperparameters</h2>
 
 <table>
   <tr><th>Parameter</th><th>Value</th><th>Effect</th></tr>
@@ -524,7 +602,7 @@ to the small candidate arrays, not the full weight matrices.</p>
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════════════ -->
-<h2 id="reasoning">11. Reasoning Layer (SDR + VSA)</h2>
+<h2 id="reasoning">13. Reasoning Layer (SDR + VSA)</h2>
 
 <p>A thin layer on top of the cortical core (no core changes) treats
 <em>reasoning as movement through a knowledge space</em> — the grid-cell

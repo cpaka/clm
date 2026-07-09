@@ -78,6 +78,13 @@ TRAIN_CONFIG = {
     "replay_every": 2,      # hippocampal replay cadence (epochs)
 }
 
+INGEST_CONFIG = {
+    # Per-night cap on new sequences folded in by the ingest cron.  Bounds the
+    # run so it always fits the function timeout; the remaining tail is picked
+    # up on subsequent nights (progress tracked via metrics.train_sequences).
+    "max_new_sequences": 2_000,
+}
+
 # Memory note (per column): n_cells × max_segs × syn_per_seg × 4 bytes × 2 arrays
 #   n_cells = col_dim × cells_per_col.  Keep max_segs modest on Modal.
 MODEL_CONFIG = {
@@ -402,12 +409,15 @@ def train(test_fraction: float = TRAIN_CONFIG["test_fraction"]) -> dict:
 # across containers, then assemble them into one ensemble.
 # ---------------------------------------------------------------------------
 
-def _load_corpus_seqs() -> list[list[str]]:
+def _load_corpus_seqs(cap: bool = True) -> list[list[str]]:
     """Load, shuffle (fixed seed), vocab-filter, and cap the corpus sequences.
 
     Rare words beyond the top CORPUS_CONFIG['vocab_size'] are replaced with
     '<UNK>'.  This keeps bigram coverage at ~5 % for better generalisation
-    even on a 1M-char Wikipedia sample."""
+    even on a 1M-char Wikipedia sample.
+
+    ``cap=False`` returns the full filtered corpus (same shuffle order, same
+    vocab) — used by ingest to reach sequences beyond the training window."""
     import random
     from collections import Counter
     from benchmarks.datasets import _tokenize
@@ -422,7 +432,7 @@ def _load_corpus_seqs() -> list[list[str]]:
         top_vocab = {w for w, _ in counter.most_common(vocab_size)}
         seqs = [[w if w in top_vocab else "<UNK>" for w in seq] for seq in seqs]
 
-    return seqs[:TRAIN_CONFIG["max_sequences"]]
+    return seqs[:TRAIN_CONFIG["max_sequences"]] if cap else seqs
 
 
 def _load_split(test_fraction: float):
@@ -854,7 +864,7 @@ def train_shards(n_shards: int = 4) -> dict:
 @app.function(
     image=image,
     volumes={_VOL_MOUNT: vol},
-    timeout=600,
+    timeout=3600,
     schedule=modal.Cron("0 3 * * *"),   # 03:00 UTC daily
 )
 def ingest() -> dict:
@@ -862,40 +872,63 @@ def ingest() -> dict:
 
     This implements continual learning: each run folds new corpus content into
     the existing model without retraining from scratch (#6 NEXT_STEPS).
-    The corpus.txt file grows over time via upload_dataset / fetch_corpus runs;
-    the model tracks how many sequences it has already seen and trains only on
-    the tail (new sequences appended since last ingest)."""
+    The corpus holds more sequences than the initial training window
+    (TRAIN_CONFIG['max_sequences']); each night up to
+    INGEST_CONFIG['max_new_sequences'] unseen sequences beyond that window are
+    folded in, using the SAME shuffle order and vocab filter as training so
+    the seen-counter, the train/test split, and the encoder vocabulary all
+    stay consistent.  Like the web app, it inherits PREV_VERSION weights when
+    this version has no checkpoint yet, and always saves to this version's dir."""
     import sys, time as _t
     sys.path.insert(0, "/root")
     from core.hierarchy import HierarchicalCLM
     from persist.store import load_model, save_model
-    from benchmarks.datasets import _tokenize
     from benchmarks.metrics import accuracy
-    import random
 
     vol.reload()
-    model_path = VOL_PATH / MODEL_DIR_NAME
-    if not model_path.exists():
-        print("[ingest] no model found — skipping")
-        return {"skipped": True, "reason": "no model"}
     if not (VOL_PATH / "corpus.txt").exists():
         print("[ingest] no corpus — skipping")
         return {"skipped": True, "reason": "no corpus"}
 
+    # Resolve weights: this version's checkpoint, else inherit PREV_VERSION's
+    model_path = VOL_PATH / MODEL_DIR_NAME
+    weights_version = VERSION
+    if not (model_path / "config.json").exists() and PREV_VERSION:
+        prev_path = Path(_VOL_MOUNT) / PREV_VERSION / MODEL_DIR_NAME
+        if (prev_path / "config.json").exists():
+            model_path = prev_path
+            weights_version = PREV_VERSION
+            print(f"[ingest] no {VERSION} checkpoint — inheriting {PREV_VERSION} weights")
+    if not (model_path / "config.json").exists():
+        print("[ingest] no model found — skipping")
+        return {"skipped": True, "reason": "no model"}
+
     t0 = _t.time()
     model = load_model(str(model_path))
 
-    # Determine how many sequences have been seen before (tracked in metrics)
+    # How far into the corpus has training progressed?  Ingest entries record
+    # train_sequences in metrics; models trained via train_parallel/shards do
+    # not, so fall back to the registry entry for the loaded weights.  Floor at
+    # the initial training window — everything below it is train or test data.
     seen = max((m.get("train_sequences", 0) for m in model.metrics), default=0)
+    if not seen:
+        reg = {e.get("version"): e for e in _read_registry()}
+        seen = reg.get(weights_version, {}).get("train_sequences", 0)
+    seen = max(seen, TRAIN_CONFIG["max_sequences"])
 
-    all_seqs = [s for s in _tokenize(
-        (VOL_PATH / "corpus.txt").read_text(encoding="utf-8")) if len(s) >= 2]
-    random.Random(0).shuffle(all_seqs)
+    # Same shuffle + vocab filter as training, but uncapped: the tail beyond
+    # the training window is genuinely unseen data (tokenizing raw text here
+    # once exploded the vocab by ~68K words and blew the function timeout).
+    all_seqs = _load_corpus_seqs(cap=False)
 
     new_seqs = all_seqs[seen:]
     if not new_seqs:
         print(f"[ingest] no new sequences (seen={seen}, total={len(all_seqs)})")
         return {"skipped": True, "reason": "no new data", "seen": seen}
+    cap = INGEST_CONFIG["max_new_sequences"]
+    if len(new_seqs) > cap:
+        print(f"[ingest] {len(new_seqs)} unseen sequences — capping tonight's run at {cap}")
+        new_seqs = new_seqs[:cap]
 
     # Incremental encoder update (#7) for any new vocab
     for unit in model.levels[0].units:
@@ -909,7 +942,7 @@ def ingest() -> dict:
                 replay_every=TRAIN_CONFIG["replay_every"])
 
     stats = model.stats()
-    train_seq, test_seq = _load_split(TRAIN_CONFIG["test_fraction"])
+    _, test_seq = _load_split(TRAIN_CONFIG["test_fraction"])
     t1, t3 = accuracy(model, test_seq, max_probes=200)
 
     # Auto-expand capacity if saturated (#9 + #10)
@@ -925,9 +958,9 @@ def ingest() -> dict:
             **{k: v for k, v in model._col_kwargs.items()
                if k not in ("cells_per_col", "periods")},
         )
-        new_unit.enc.update(all_seqs)
-        new_unit.train_sequence   # unit will learn on next ingest cycle
-        model.append_unit(new_unit)
+        if new_unit.enc is not None:
+            new_unit.enc.update(new_seqs)
+        model.append_unit(new_unit)   # unit learns on subsequent ingest cycles
 
     entry = {
         "epoch": len(model.metrics) + 1,
@@ -939,7 +972,10 @@ def ingest() -> dict:
         "train_sequences": seen + len(new_seqs),
     }
     model.metrics.append(entry)
-    save_model(model, str(model_path))
+    # Always save to THIS version's dir (weights may have been inherited from
+    # PREV_VERSION) so the web app picks up the version's own checkpoint.
+    VOL_PATH.mkdir(parents=True, exist_ok=True)
+    save_model(model, str(VOL_PATH / MODEL_DIR_NAME))
     (VOL_PATH / "metrics.json").write_text(json.dumps(model.metrics, indent=2))
     _upsert_registry({
         "version": VERSION,

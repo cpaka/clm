@@ -22,6 +22,7 @@ Usage
 """
 from __future__ import annotations
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 
@@ -38,6 +39,14 @@ def checkpoint_path(base: str, name: str = "model") -> str:
 
 # ── Save ─────────────────────────────────────────────────────────────────────
 
+def _savez_atomic(root: Path, name: str, **arrays) -> None:
+    """np.savez_compressed via tmp-file + rename, so a killed save (function
+    timeout, OOM) never leaves a truncated .npz at the final path."""
+    tmp = root / f".tmp_{name}"
+    with open(tmp, "wb") as f:
+        np.savez_compressed(f, **arrays)
+    os.replace(tmp, root / name)
+
 def save_model(model: HierarchicalCLM, path: str) -> None:
     """
     Persist all model state to `path` (directory created if needed).
@@ -53,7 +62,75 @@ def save_model(model: HierarchicalCLM, path: str) -> None:
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
 
-    # Config + metrics
+    # Leftover tmp files from a previously killed save
+    for stale in root.glob(".tmp_*"):
+        stale.unlink()
+
+    if model.levels:
+        for li, level in enumerate(model.levels):
+            for ui, unit in enumerate(level.units):
+                tag = f"l{li}_u{ui}"
+
+                # Column state
+                _savez_atomic(
+                    root, f"col_{tag}.npz",
+                    seg_idx=unit.col.seg_idx,
+                    seg_perm=unit.col.seg_perm,
+                    n_segs=unit.col.n_segs,
+                )
+
+                # Spatial Pooler weights (learned representations), if present
+                if getattr(unit, "sp", None) is not None:
+                    _savez_atomic(root, f"sp_{tag}.npz", **unit.sp.state())
+
+                # Token SDR map + inverted index
+                if unit._token_sdr:
+                    tokens = list(unit._token_sdr.keys())
+                    sdrs = np.stack([unit._token_sdr[t] for t in tokens])
+                    _savez_atomic(
+                        root, f"token_sdr_{tag}.npz",
+                        tokens=np.array(tokens, dtype=object),
+                        sdrs=sdrs,
+                    )
+
+                # SemanticEncoder fingerprints + accumulator (#7)
+                if isinstance(unit.enc, SemanticEncoder) and unit.enc.fp:
+                    vocab = list(unit.enc.fp.keys())
+                    fps = np.stack([unit.enc.fp[t] for t in vocab])
+                    _savez_atomic(
+                        root, f"enc_{tag}.npz",
+                        vocab=np.array(vocab, dtype=object),
+                        fps=fps,
+                    )
+                    # Save accumulator so update() can continue from this state
+                    if hasattr(unit.enc, "_acc") and unit.enc._acc:
+                        acc_vocab = list(unit.enc._acc.keys())
+                        acc_vecs = np.stack([unit.enc._acc[t] for t in acc_vocab])
+                        df_vals = np.array([unit.enc._df.get(t, 0) for t in acc_vocab],
+                                           dtype=np.int64)
+                        _savez_atomic(
+                            root, f"enc_acc_{tag}.npz",
+                            vocab=np.array(acc_vocab, dtype=object),
+                            acc=acc_vecs,
+                            df=df_vals,
+                        )
+
+        # Replay buffer (#8) — persist surprise episodes for cross-session replay
+        if model.replay and model.replay.size:
+            seqs = []
+            bursts = []
+            for seq, br in model.replay._buf:
+                seqs.append(" ".join(seq))
+                bursts.append(br)
+            _savez_atomic(
+                root, "replay.npz",
+                sequences=np.array(seqs, dtype=object),
+                burst_rates=np.array(bursts, dtype=np.float32),
+            )
+
+    # Config + metrics — written LAST: n_units only advertises a unit once all
+    # of that unit's files exist, so a save killed midway leaves the previous
+    # (still loadable) checkpoint description rather than phantom units.
     cfg = {
         "n_levels": model.n_levels,
         "strides": list(model.strides),
@@ -70,71 +147,9 @@ def save_model(model: HierarchicalCLM, path: str) -> None:
         },
         "metrics": model.metrics,
     }
-    (root / "config.json").write_text(json.dumps(cfg, indent=2))
-
-    if not model.levels:
-        return  # nothing trained yet
-
-    for li, level in enumerate(model.levels):
-        for ui, unit in enumerate(level.units):
-            tag = f"l{li}_u{ui}"
-
-            # Column state
-            np.savez_compressed(
-                root / f"col_{tag}.npz",
-                seg_idx=unit.col.seg_idx,
-                seg_perm=unit.col.seg_perm,
-                n_segs=unit.col.n_segs,
-            )
-
-            # Spatial Pooler weights (learned representations), if present
-            if getattr(unit, "sp", None) is not None:
-                np.savez_compressed(root / f"sp_{tag}.npz", **unit.sp.state())
-
-            # Token SDR map + inverted index
-            if unit._token_sdr:
-                tokens = list(unit._token_sdr.keys())
-                sdrs = np.stack([unit._token_sdr[t] for t in tokens])
-                np.savez_compressed(
-                    root / f"token_sdr_{tag}.npz",
-                    tokens=np.array(tokens, dtype=object),
-                    sdrs=sdrs,
-                )
-
-            # SemanticEncoder fingerprints + accumulator (#7)
-            if isinstance(unit.enc, SemanticEncoder) and unit.enc.fp:
-                vocab = list(unit.enc.fp.keys())
-                fps = np.stack([unit.enc.fp[t] for t in vocab])
-                np.savez_compressed(
-                    root / f"enc_{tag}.npz",
-                    vocab=np.array(vocab, dtype=object),
-                    fps=fps,
-                )
-                # Save accumulator so update() can continue from this state
-                if hasattr(unit.enc, "_acc") and unit.enc._acc:
-                    acc_vocab = list(unit.enc._acc.keys())
-                    acc_vecs = np.stack([unit.enc._acc[t] for t in acc_vocab])
-                    df_vals = np.array([unit.enc._df.get(t, 0) for t in acc_vocab],
-                                       dtype=np.int64)
-                    np.savez_compressed(
-                        root / f"enc_acc_{tag}.npz",
-                        vocab=np.array(acc_vocab, dtype=object),
-                        acc=acc_vecs,
-                        df=df_vals,
-                    )
-
-    # Replay buffer (#8) — persist surprise episodes for cross-session replay
-    if model.replay and model.replay.size:
-        seqs = []
-        bursts = []
-        for seq, br in model.replay._buf:
-            seqs.append(" ".join(seq))
-            bursts.append(br)
-        np.savez_compressed(
-            root / "replay.npz",
-            sequences=np.array(seqs, dtype=object),
-            burst_rates=np.array(bursts, dtype=np.float32),
-        )
+    tmp_cfg = root / ".tmp_config.json"
+    tmp_cfg.write_text(json.dumps(cfg, indent=2))
+    os.replace(tmp_cfg, root / "config.json")
 
 
 # ── Load ─────────────────────────────────────────────────────────────────────

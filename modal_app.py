@@ -864,7 +864,10 @@ def train_shards(n_shards: int = 4) -> dict:
 @app.function(
     image=image,
     volumes={_VOL_MOUNT: vol},
-    timeout=3600,
+    # Train time grows with n_units (saturation appends one most nights); the
+    # 2026-07-15 run outgrew 3600s and was killed mid-save_model, truncating
+    # col_l0_u5.npz on the Volume. Saves are atomic now, but keep headroom.
+    timeout=3600 * 3,
     schedule=modal.Cron("0 3 * * *"),   # 03:00 UTC daily
 )
 def ingest() -> dict:

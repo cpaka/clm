@@ -328,28 +328,68 @@ stop.
 
 ## Quickstart (deploy in ~10 minutes)
 
-You do **not** need to understand any of the above to run CLM. You need a free
-Modal account and a Kaggle account (for the training text).
+You do **not** need to understand any of the above to run CLM. Training and
+serving happen entirely on [Modal](https://modal.com) (serverless, free tier is
+enough); the only thing you run on your own machine is the `modal` CLI. You'll
+need two free accounts:
 
-### Prerequisites
-- [Modal account](https://modal.com) and the `modal` CLI (Python 3.11+).
-- Kaggle credentials stored as a Modal secret named `kaggle-credentials`
-  (username + API key — used once to fetch the Wikipedia corpus).
+- a **Modal** account — runs the training + web app,
+- a **Kaggle** account — hosts the Wikipedia training text (downloaded once).
+
+### Step 1 — Get the code
 
 ```bash
-pip install modal
-modal setup                 # log in / link your Modal account
+git clone https://github.com/cpaka/clm.git
+cd clm
 ```
 
-### One-time dataset upload
+### Step 2 — Install the Modal CLI and log in
+
+The only local dependency is Python 3.11+ and the `modal` package. You do **not**
+need numpy, a GPU, or any of the project requirements locally — those live in the
+Modal container image.
+
 ```bash
-make upload-dataset         # Simple-English Wikipedia → shared Modal Volume
+pip install modal          # the CLI that submits jobs to Modal
+modal setup                # opens a browser to log in / link your Modal account
 ```
 
-### Deploy + train
+### Step 3 — Give Modal your Kaggle credentials (one time)
+
+The corpus lives on Kaggle, so Modal needs a Kaggle API key to fetch it once.
+
+1. Create a Kaggle account, then go to **kaggle.com → your avatar → Settings →
+   API → "Create New Token"**. This downloads a `kaggle.json` file containing
+   your `username` and `key`.
+2. Accept this dataset's license (click **Download** once while logged in):
+   <https://www.kaggle.com/datasets/ffatty/plain-text-wikipedia-simpleenglish>
+   (otherwise the upload step returns `403 Forbidden`).
+3. Store those two values as a Modal secret named **`kaggle-credentials`** — the
+   env-var names must be exactly `KAGGLE_USERNAME` and `KAGGLE_KEY`:
+
 ```bash
-make deploy                 # modal deploy + bootstrap (fetch corpus → train → register)
-make logs                   # tail the running web app
+modal secret create kaggle-credentials \
+    KAGGLE_USERNAME=<your-kaggle-username> \
+    KAGGLE_KEY=<your-kaggle-api-key>
+```
+
+(You can also create it from the Modal dashboard: **Secrets → Create → Custom**,
+with the same two keys.)
+
+### Step 4 — Upload the dataset (one time, shared across all versions)
+
+```bash
+make upload-dataset        # Simple-English Wikipedia (~178 MB) → shared Modal Volume
+```
+
+This downloads the corpus into the shared `cglm-data` Volume once; every model
+version reuses it, so you never repeat this step.
+
+### Step 5 — Deploy + train
+
+```bash
+make deploy                # modal deploy + bootstrap (fetch corpus slice → train → register)
+make logs                  # tail the running web app; prints the public URL
 ```
 
 `bootstrap` samples a corpus slice, trains the model, writes `model.clm` +
@@ -389,6 +429,10 @@ architecture page.
 ---
 
 ## Run locally (no Modal, no GPU)
+
+Optional — this path skips Modal entirely and runs the benchmarks, tests, and
+Python API on your own machine. The only dependency is numpy (clone the repo
+first, per Step 1 above):
 
 ```bash
 pip install numpy
